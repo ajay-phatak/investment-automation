@@ -1,0 +1,26 @@
+# Personal theses — keep your real ones private. Commit theses.example.md instead.
+theses.md
+
+# Generated reports may contain personal opinions / position-revealing content.
+reports/
+
+# Local execution logs.
+logs/
+
+# Environment & secrets.
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
