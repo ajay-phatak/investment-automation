@@ -1,0 +1,3 @@
+yfinance
+alpaca-py
+pyyaml
