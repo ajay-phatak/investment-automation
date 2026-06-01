@@ -23,9 +23,15 @@ Usage:
     python thesis_research.py --thesis "AI infra"      # filter by title substring
     python thesis_research.py --test                   # print, don't save
     python thesis_research.py --no-web                 # disable WebSearch
+
+Weekend-batch mode (spreads the Claude calls across many scheduled runs so a
+single 5-hour quota window is never spiked):
+    python thesis_research.py --research-next          # research ONE pending unit
+    python thesis_research.py --assemble               # stitch the batch into a report
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -46,15 +52,25 @@ SCRIPT_DIR = Path(__file__).parent
 DEFAULT_THESES_FILE = SCRIPT_DIR / "theses.md"
 EXAMPLE_THESES_FILE = SCRIPT_DIR / "theses.example.md"
 REPORTS_DIR = SCRIPT_DIR / "reports"
+# Weekend-batch state: one manifest per upcoming-Monday batch lives here.
+PARTIAL_DIR = REPORTS_DIR / "partial"
+ARCHIVE_DIR = PARTIAL_DIR / "archive"
+# A unit that keeps failing is dropped after this many attempts so weekend
+# slots don't burn forever retrying a genuinely broken thesis.
+MAX_ATTEMPTS = 3
 ET = ZoneInfo("America/New_York")
 
 ALPACA_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET = os.environ.get("ALPACA_API_SECRET")
 ALPACA_FEED = os.environ.get("ALPACA_FEED", "iex").lower()
 
-CLAUDE_MODEL = "claude-opus-4-7"
+CLAUDE_MODEL = "claude-opus-4-8"
 # Web research is materially slower than the price-only brief — give it room.
 CLAUDE_TIMEOUT_SEC = 900
+
+# Each thesis gets a hypothetical, educational mock portfolio of this size.
+# One-line edit to change it — applies to both the all-at-once and weekend runs.
+MOCK_PORTFOLIO_USD = 5000
 
 
 # ── Claude Code CLI plumbing ────────────────────────────────────────────────
@@ -382,10 +398,26 @@ downside: [TICKER6]
 ### Notes
 One short line per ticker you suggested above, explaining why it's on the list. Format: `**TICKER**: rationale.` Keep each line under 25 words.
 
+### Mock Portfolio (~${MOCK_PORTFOLIO_USD:,} hypothetical — educational, not financial advice)
+Construct ONE balanced hypothetical ${MOCK_PORTFOLIO_USD:,} allocation that expresses this thesis. Build it from the tickers you surfaced in Indexes/Stocks above (their live price and 52-week context is in the tables there). Present it as a **Markdown table** — NOT a yaml block — with columns: `Ticker | Role | Allocation | Weight | Rationale`. End with a **Total** row that sums to ≈ ${MOCK_PORTFOLIO_USD:,}.
+- `Role` is one of: `core`, `speculative`, `hedge`, `overlay`.
+  - `core` = liquid, lower-variance expression of the thesis (the anchor).
+  - `speculative` = concentrated, catalyst-direct, higher-variance satellite.
+  - `hedge` = offsets a specific risk in the book.
+  - `overlay` = an OPTIONAL small options sleeve (e.g. calls/puts on a core name) — at most one, kept modest.
+- Aim for genuine balance: a core anchor, one or two speculative satellites, and an optional small overlay — sized to each leg's conviction and risk, not split evenly by default.
+
+### Scenario Matrix
+A **Markdown table** with columns: `Scenario | What it looks like | Portfolio impact`. Cover at least three rows: the thesis plays out, a partial / delayed outcome, and the thesis failing or being invalidated.
+
+### Trigger Logic
+The key catalyst date(s) and the specific conditions that would make you ADD, TRIM, or EXIT each leg. Be concrete about dates and price/event thresholds wherever the thesis provides them.
+
 CRITICAL FORMATTING RULES:
 - The yaml blocks must use plain ASCII tickers (e.g. NVDA, SMH, TLRY). For non-US listings, use the full Yahoo-Finance-style symbol (e.g. TLRY.TO, SHOP.TO, ASML.AS).
 - Do not put commentary inside the yaml blocks — only the ticker lists.
 - If a side is empty (e.g. no clear downside indexes), use an empty list `[]`, do not omit the key.
+- The Mock Portfolio and Scenario Matrix MUST be Markdown tables, never yaml — only the Indexes and Stocks lists use yaml.
 """
 
 
@@ -511,6 +543,219 @@ def _ts() -> str:
     return datetime.now(ET).strftime("%H:%M:%S")
 
 
+# ── Weekend-batch mode ──────────────────────────────────────────────────────
+#
+# The default `run()` does every Claude call in one process, spiking the
+# 5-hour subscription quota. Weekend-batch mode breaks the work into one
+# Claude call per scheduled invocation, sharing state through a JSON manifest:
+#
+#   --research-next : research the next pending unit (one Claude call), persist
+#   --assemble      : stitch all researched units into the Monday report
+#
+# A "unit" is one thesis, or the final new-thesis scan. The manifest snapshots
+# theses.md at batch creation, so editing theses.md mid-weekend can't corrupt
+# an in-progress batch.
+
+def upcoming_monday(d: date | None = None) -> date:
+    """The Monday this batch belongs to — today if today is Monday, else the
+    next Monday. Weekend research runs and the Monday assembly all resolve to
+    the same date, so they share one manifest."""
+    d = d or date.today()
+    return d + timedelta(days=(0 - d.weekday()) % 7)
+
+
+def manifest_path(monday: date) -> Path:
+    return PARTIAL_DIR / f"batch_{monday.isoformat()}.json"
+
+
+def load_manifest(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_manifest(path: Path, manifest: dict) -> None:
+    """Write atomically (temp + replace) so an interrupted scheduled run can't
+    leave a half-written manifest."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def create_manifest(theses_path: Path, monday: date) -> dict:
+    """Build a fresh batch manifest from theses.md. The new-thesis scan is
+    always appended as the final unit so it runs after the user's own theses."""
+    preamble, theses = parse_theses(theses_path)
+    units = []
+    for i, t in enumerate(theses, 1):
+        units.append({
+            "id": f"thesis-{i}",
+            "kind": "thesis",
+            "title": t["title"],
+            "body": t["body"],
+            "status": "pending",       # pending | done
+            "attempts": 0,
+            "last_error": None,
+            "raw_response": None,
+            "researched_at": None,
+        })
+    units.append({
+        "id": "new-thesis-scan",
+        "kind": "scan",
+        "title": None,
+        "body": None,
+        "status": "pending",
+        "attempts": 0,
+        "last_error": None,
+        "raw_response": None,
+        "researched_at": None,
+    })
+    return {
+        "batch_date": monday.isoformat(),
+        "created_at": datetime.now(ET).isoformat(),
+        "theses_source": theses_path.name,
+        "strategy_preamble": preamble,
+        "units": units,
+    }
+
+
+def _next_unit(manifest: dict) -> dict | None:
+    """First unit still worth working on: pending and under the attempt cap."""
+    return next(
+        (u for u in manifest["units"]
+         if u["status"] == "pending" and u["attempts"] < MAX_ATTEMPTS),
+        None,
+    )
+
+
+def run_research_next(args: argparse.Namespace) -> None:
+    """Weekend worker. Researches exactly ONE pending unit, then exits — so
+    each scheduled slot makes a single Claude call. Idempotent and retry-safe:
+    a failed unit stays pending for a later slot; extra slots no-op cleanly."""
+    theses_path = Path(args.theses) if args.theses else DEFAULT_THESES_FILE
+    monday = upcoming_monday()
+    mpath = manifest_path(monday)
+
+    if mpath.exists():
+        manifest = load_manifest(mpath)
+        print(f"[{_ts()}] Resuming batch {manifest['batch_date']} ({mpath.name}).")
+    else:
+        if not theses_path.exists():
+            print(f"[{_ts()}] Theses file not found: {theses_path} — cannot start a batch.")
+            sys.exit(1)
+        manifest = create_manifest(theses_path, monday)
+        save_manifest(mpath, manifest)
+        print(f"[{_ts()}] Created batch {manifest['batch_date']} "
+              f"with {len(manifest['units'])} units → {mpath.name}")
+
+    unit = _next_unit(manifest)
+    if unit is None:
+        done = sum(1 for u in manifest["units"] if u["status"] == "done")
+        total = len(manifest["units"])
+        print(f"[{_ts()}] Nothing pending ({done}/{total} done) — slot is a no-op.")
+        return
+
+    allow_web = not args.no_web
+    label = unit["title"] or "new-thesis scan"
+    print(f"[{_ts()}] Researching {unit['id']}: {label!r} "
+          f"(attempt {unit['attempts'] + 1}/{MAX_ATTEMPTS})")
+
+    if unit["kind"] == "thesis":
+        prompt = build_thesis_prompt(
+            manifest["strategy_preamble"],
+            {"title": unit["title"], "body": unit["body"]},
+            allow_web,
+        )
+    else:
+        existing = [u["title"] for u in manifest["units"] if u["kind"] == "thesis"]
+        prompt = build_new_thesis_prompt(manifest["strategy_preamble"], existing, allow_web)
+
+    unit["attempts"] += 1
+    try:
+        response = call_claude(prompt, allow_web=allow_web)
+    except Exception as e:
+        unit["last_error"] = str(e)[:1000]
+        save_manifest(mpath, manifest)
+        print(f"[{_ts()}] Claude call failed — {unit['id']} left pending for a later slot.")
+        print(f"[{_ts()}] Error: {e}")
+        sys.exit(1)
+
+    unit["status"] = "done"
+    unit["raw_response"] = response
+    unit["researched_at"] = datetime.now(ET).isoformat()
+    unit["last_error"] = None
+    save_manifest(mpath, manifest)
+    remaining = sum(1 for u in manifest["units"] if u["status"] == "pending")
+    print(f"[{_ts()}] {unit['id']} done. {remaining} unit(s) still pending.")
+
+
+def run_assemble(args: argparse.Namespace) -> None:
+    """Monday step. Stitches every researched unit in this week's batch into
+    one report, with a single consistent ticker-price snapshot taken now.
+    Units that never completed render as a clear placeholder rather than
+    blocking the report."""
+    monday = upcoming_monday()
+    mpath = manifest_path(monday)
+    if not mpath.exists():
+        print(f"[{_ts()}] No batch manifest for {monday.isoformat()} ({mpath.name}). "
+              "Nothing to assemble — did the weekend job run?")
+        return
+
+    manifest = load_manifest(mpath)
+    units = manifest["units"]
+    done = [u for u in units if u["status"] == "done"]
+    print(f"[{_ts()}] Assembling batch {manifest['batch_date']}: "
+          f"{len(done)}/{len(units)} units researched.")
+
+    # Enrich every ticker across the whole batch in one pass — all prices share
+    # one Monday snapshot rather than drifting across the weekend's runs.
+    all_tickers: list[str] = []
+    for u in done:
+        all_tickers += extract_tickers_from_response(u["raw_response"])
+    enrichment = enrich_tickers(all_tickers)
+
+    sections: list[str] = []
+    for u in units:
+        if u["status"] == "done":
+            rendered = replace_yaml_blocks_with_tables(u["raw_response"], enrichment)
+            if u["kind"] == "thesis":
+                sections.append(f"## Thesis: {u['title']}\n\n{rendered}")
+            else:
+                sections.append(rendered)
+        else:
+            err = f" Last error: {u['last_error']}" if u.get("last_error") else ""
+            placeholder = (f"> ⚠ Not researched this batch — "
+                           f"{u['attempts']} attempt(s).{err}")
+            if u["kind"] == "thesis":
+                sections.append(f"## Thesis: {u['title']}\n\n{placeholder}")
+            else:
+                sections.append(f"## Suggested new theses\n\n{placeholder}")
+
+    batch_date = manifest["batch_date"]
+    header = (f"# Market Research — {batch_date}\n\n"
+              f"_Weekend batch assembled {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} "
+              f"from {manifest['theses_source']} · "
+              f"{len(done)}/{len(units)} units researched_\n")
+    report = f"{header}\n" + "\n\n---\n\n".join(sections) + "\n"
+
+    if args.test:
+        print(f"[{_ts()}] Test mode — not saving, manifest left in place.")
+        print("\n" + "=" * 60)
+        print(report)
+        print("=" * 60 + "\n")
+        return
+
+    REPORTS_DIR.mkdir(exist_ok=True)
+    out = REPORTS_DIR / f"{batch_date}_research.md"
+    out.write_text(report, encoding="utf-8")
+    print(f"[{_ts()}] Report saved → {out}")
+
+    # Archive the manifest so next weekend starts a fresh batch.
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    archived = ARCHIVE_DIR / mpath.name
+    os.replace(mpath, archived)
+    print(f"[{_ts()}] Manifest archived → {archived}")
+
+
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -520,14 +765,28 @@ if __name__ == "__main__":
     parser.add_argument("--skip-new-thesis-scan", action="store_true", help="Skip the closing 'suggest new theses' pass")
     parser.add_argument("--test", action="store_true", help="Print report, don't save")
     parser.add_argument("--no-web", action="store_true", help="Disable WebSearch/WebFetch (faster, shallower)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--research-next", action="store_true",
+                      help="Weekend worker: research the next pending unit in this week's batch, then exit")
+    mode.add_argument("--assemble", action="store_true",
+                      help="Stitch this week's researched batch into the Monday report")
     args = parser.parse_args()
 
     print(f"\n{'=' * 60}")
-    print(f"  THESIS RESEARCH AGENT")
+    if args.research_next:
+        print(f"  THESIS RESEARCH AGENT — WEEKEND WORKER")
+    elif args.assemble:
+        print(f"  THESIS RESEARCH AGENT — ASSEMBLE BATCH")
+    else:
+        print(f"  THESIS RESEARCH AGENT")
     print(f"{'=' * 60}\n")
 
-    report = run(args)
-
-    print("\n" + "=" * 60)
-    print(report)
-    print("=" * 60 + "\n")
+    if args.research_next:
+        run_research_next(args)
+    elif args.assemble:
+        run_assemble(args)
+    else:
+        report = run(args)
+        print("\n" + "=" * 60)
+        print(report)
+        print("=" * 60 + "\n")
