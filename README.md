@@ -2,16 +2,46 @@
 
 Thesis-driven market research. You write down what you think the market is mispricing; the agent steel-mans and devil's-advocates each thesis, suggests indexes and stocks with potential upside/downside if your thesis is right, enriches every ticker with live price + 52-week range context, builds a balanced hypothetical mock portfolio expressing the thesis, and proposes one or two new theses worth considering.
 
-It is **not** a portfolio tracker — it never sees your positions. Inputs are beliefs about the market; outputs are research notes.
+It runs weekly, tracks how your conviction in each thesis evolves, and backtests its own hypothetical mock portfolios over time.
+
+It is **not** a portfolio tracker — it never sees your real positions. Inputs are beliefs about the market; outputs are research notes.
 
 > **Mock portfolios are hypothetical and educational — not financial advice.** Each thesis gets an illustrative ~$5,000 allocation (core / speculative / hedge / optional options overlay) with a scenario matrix and trigger logic, purely as a sizing-and-thinking exercise. Do your own diligence. Change the size by editing `MOCK_PORTFOLIO_USD` in `thesis_research.py`.
 
 ## How it works
 
 1. You maintain `theses.md`, a plain Markdown file with one `## Thesis: …` block per belief.
-2. The script invokes the Claude Code CLI (`claude -p`) once per thesis with WebSearch enabled, asking for a structured response: steel man, devil's advocate, suggested indexes/stocks, a mock ~$5,000 portfolio, a scenario matrix, and trigger logic.
+2. For each thesis the script makes **two** Claude Code CLI (`claude -p`) calls. The first **analysis** pass (WebSearch on) returns the steel man, devil's advocate, and suggested indexes/stocks. Those tickers are then priced (step 3) and fed into a second **portfolio** pass that sizes a mock ~$5,000 portfolio against the *live* prices — with real per-share prices and share counts — plus a scenario matrix and trigger logic.
 3. Tickers the model returns are deduplicated and enriched with live price + 52-week high/low via Alpaca (with yfinance fallback).
 4. A consolidated Markdown report is saved to `reports/{date}_research.md`.
+
+> Why two passes: enrichment can only happen *after* the model names its tickers, so a single call would have to size the portfolio without knowing any prices. The second pass closes that gap so dollar allocations and share counts are grounded in real quotes.
+
+## Week-over-week tracking & backtest ledger
+
+Every report also writes a structured **history sidecar** next to it
+(`reports/{date}_research.json`) capturing, per thesis: a conviction score (1–5) +
+direction, the catalyst dates flagged, the mock-portfolio holdings with entry prices,
+the realized return of the *prior* week's portfolio, and a running equity index. This
+turns each weekly report from a standalone essay into a continuous record:
+
+- **Continuity.** When a prior sidecar exists for a thesis, last week's take is threaded
+  into the analysis prompt, so the report opens with a **"Since last week"** section —
+  what changed, whether the catalysts you flagged actually fired, and whether price
+  action confirmed or contradicted the thesis — plus a conviction line showing the move
+  (e.g. `Conviction: 3/5 (↓ from 4 last week)`).
+- **Performance.** A per-thesis **Portfolio performance** block marks last week's mock
+  portfolio to current prices (week-over-week return) and tracks a since-inception equity
+  curve. Options overlays and any ticker with no current price are excluded and noted.
+- **Calibration.** A book-level **Conviction Calibration & Ledger** section summarizes
+  every thesis and, once enough history accrues, reports whether higher-conviction weeks
+  were actually followed by better subsequent returns.
+
+Theses are matched across weeks by their normalized title, so **substantially renaming a
+thesis resets its history** (it's treated as new). This adds no extra Claude calls — the
+continuity folds into the existing analysis pass; performance and calibration are computed
+mechanically. Ad-hoc runs (`--test`, or `--thesis` filters) read prior history but don't
+overwrite the sidecar.
 
 ## Setup
 
@@ -84,8 +114,9 @@ How it works:
 - `--research-next` creates a **batch manifest** (`reports/partial/batch_{Monday}.json`)
   on its first run of the weekend, snapshotting `theses.md` so mid-weekend edits
   can't corrupt an in-progress batch. Each subsequent run picks the next pending
-  thesis (the new-thesis scan runs last), makes one Claude call, and records it.
-  A failed call stays pending and is retried by a later run.
+  thesis (the new-thesis scan runs last) and fully finishes it — a web research
+  pass plus a price-grounded portfolio pass — recording both. A failed call leaves
+  the unit pending and a later run retries it from the top.
 - `--assemble` reads the manifest, enriches every ticker in one pass (so all
   prices share one Monday snapshot), writes `reports/{Monday}_research.md`, and
   archives the manifest. Theses that never completed are flagged in the report
@@ -104,14 +135,16 @@ powershell -ExecutionPolicy Bypass -File setup_schedule.ps1
 | `ThesisResearch-Weekend` | Sat 06:00, 09:00, 12:00, 15:00, 18:00, 21:00; Sun 09:00, 12:00 | `run_research_next.bat` |
 | `ThesisResearch-Assemble` | Mon 07:00 | `run_assemble.bat` |
 
-Eight weekend slots, ~3 hours apart — any rolling 5-hour quota window holds at
-most ~2 calls. Surplus slots no-op cleanly (or retry a failed thesis). **If your
-book ever exceeds 8 theses**, add more triggers to `setup_schedule.ps1` and
-re-run it (re-running is safe — it replaces the tasks).
+Eight weekend slots, ~3 hours apart — so any rolling 5-hour quota window touches
+at most ~2 theses. Each thesis now makes two Claude calls (research + portfolio;
+the portfolio pass runs with WebSearch off, so it's the cheaper of the two), so
+budget ~4 calls per window. Surplus slots no-op cleanly (or retry a failed
+thesis). **If your book ever exceeds 8 theses**, add more triggers to
+`setup_schedule.ps1` and re-run it (re-running is safe — it replaces the tasks).
 
 Logs land in `logs/weekend.log` and `logs/assemble.log`. Verify the tasks with
 `Get-ScheduledTask -TaskName 'ThesisResearch-*'`.
 
 ## What's gitignored
 
-`theses.md` and `reports/` are gitignored by default — the example theses file is the only thing in the repo. Your real beliefs and generated research stay local.
+`theses.md` and `reports/` are gitignored by default — the example theses file is the only thing in the repo. Your real beliefs, generated research, and the history sidecars (`reports/*_research.json`) all stay local.
