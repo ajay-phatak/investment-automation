@@ -257,6 +257,15 @@ def position_pct(price: float, low: float, high: float) -> str:
     return f"{pct:.0f}%"
 
 
+def _is_priced(info: dict | None) -> bool:
+    """True only if enrichment carries a usable, finite price. Filters out error
+    entries and NaN prices (yfinance occasionally returns NaN for some listings)."""
+    if not info or "error" in info:
+        return False
+    price = info.get("price")
+    return isinstance(price, (int, float)) and price == price  # NaN != NaN
+
+
 # ── Ticker extraction & rendering ───────────────────────────────────────────
 
 YAML_BLOCK_RE = re.compile(r"```yaml\s*\n(.*?)\n```", re.DOTALL)
@@ -323,7 +332,7 @@ def render_ticker_table(yaml_text: str, enrichment: dict) -> str:
     ]
     for side, ticker in rows:
         info = enrichment.get(ticker)
-        if not info or "error" in (info or {}):
+        if not _is_priced(info):
             err = (info or {}).get("error", "no data")
             lines.append(f"| {ticker} | {side} | _{err}_ | — | — | — |")
             continue
@@ -342,9 +351,28 @@ def replace_yaml_blocks_with_tables(response: str, enrichment: dict) -> str:
     return YAML_BLOCK_RE.sub(_sub, response)
 
 
+def format_enrichment_table(enrichment: dict) -> str:
+    """Render enriched tickers into a compact Markdown price table for feeding into
+    the portfolio (pass-2) prompt. Skips tickers that errored or have no data."""
+    rows = [
+        f"| {t} | ${info['price']:.2f} | ${info['low_52w']:.2f} | ${info['high_52w']:.2f} | "
+        f"{position_pct(info['price'], info['low_52w'], info['high_52w'])} |"
+        for t, info in sorted(enrichment.items())
+        if _is_priced(info)
+    ]
+    if not rows:
+        return "(no live prices available)"
+    header = [
+        "| Ticker | Price | 52w Low | 52w High | % of Range |",
+        "|--------|-------|---------|----------|------------|",
+    ]
+    return "\n".join(header + rows)
+
+
 # ── Prompt builders ─────────────────────────────────────────────────────────
 
-def build_thesis_prompt(strategy_preamble: str, thesis: dict, allow_web: bool) -> str:
+def build_analysis_prompt(strategy_preamble: str, thesis: dict, allow_web: bool,
+                          prior_context: str | None = None) -> str:
     today = datetime.now(ET).strftime("%A, %B %d, %Y")
     web_instruction = (
         "Use WebSearch and WebFetch aggressively to ground your analysis in current "
@@ -355,6 +383,15 @@ def build_thesis_prompt(strategy_preamble: str, thesis: dict, allow_web: bool) -
         else "WebSearch is disabled for this run — work from your training knowledge "
              "and acknowledge any areas where current information would change the picture."
     )
+    continuity = f"\n\n{prior_context}\n" if prior_context else ""
+    since_section = (
+        "### Since last week\n"
+        "3-6 bullets on what has changed since your prior take: did the catalysts you "
+        "flagged resolve (and how), did price action confirm or contradict the thesis, and "
+        "what is the net effect on conviction. Be specific — cite dates and numbers.\n\n"
+        if prior_context else ""
+    )
+    direction_values = "up | down | flat (versus your prior conviction)" if prior_context else "n/a"
 
     return f"""You are an investment research analyst helping a sophisticated retail investor stress-test one of their investment theses. Today is {today}.
 
@@ -364,7 +401,7 @@ INVESTOR'S STRATEGY CONTEXT (use this to keep ticker suggestions aligned with ho
 THE THESIS UNDER REVIEW:
 ## Thesis: {thesis['title']}
 
-{thesis['body']}
+{thesis['body']}{continuity}
 
 YOUR JOB:
 {web_instruction}
@@ -373,7 +410,7 @@ Produce a critical analysis of this thesis. Bear in mind: by definition, a thesi
 
 OUTPUT FORMAT — follow exactly. Do not add a top-level header; the script wraps your output.
 
-### Steel man (best arguments FOR the thesis)
+{since_section}### Steel man (best arguments FOR the thesis)
 3-6 bullets. Be concrete and specific — cite numbers, names, dates, recent events. Skip generic platitudes.
 
 ### Devil's advocate (best arguments AGAINST the thesis)
@@ -398,26 +435,64 @@ downside: [TICKER6]
 ### Notes
 One short line per ticker you suggested above, explaining why it's on the list. Format: `**TICKER**: rationale.` Keep each line under 25 words.
 
+Finally, end your output with a SINGLE fenced yaml metadata block — no heading, nothing after it. The script parses this, so keep it machine-clean:
+
+```yaml
+conviction: 3            # integer 1 (weak / would barely hold) to 5 (high conviction)
+direction: {direction_values}
+conviction_note: "one short line on your conviction and what moved it"
+catalysts:
+  - {{date: 2026-08-15, what: "what happens on/around then"}}
+```
+
+CRITICAL FORMATTING RULES:
+- The Indexes/Stocks yaml blocks must use plain ASCII tickers (e.g. NVDA, SMH, TLRY). For non-US listings, use the full Yahoo-Finance-style symbol (e.g. TLRY.TO, SHOP.TO, ASML.AS).
+- Do not put commentary inside the yaml blocks — only the ticker lists.
+- If a side is empty (e.g. no clear downside indexes), use an empty list `[]`, do not omit the key.
+- Only the Indexes/Stocks lists and the final metadata block use yaml. Do NOT output a mock portfolio, scenario matrix, or trigger logic in this pass — those are built in a second pass once live prices are available.
+- The metadata block must have an integer `conviction` and ISO-format (YYYY-MM-DD) `catalysts` dates.
+"""
+
+
+def build_portfolio_prompt(strategy_preamble: str, thesis: dict, analysis_text: str, price_table: str) -> str:
+    today = datetime.now(ET).strftime("%A, %B %d, %Y")
+    return f"""You are an investment research analyst constructing a hypothetical, educational mock portfolio for one of a sophisticated retail investor's theses. Today is {today}. This is the SECOND pass: the analysis and candidate tickers already exist, and you now have LIVE prices to size positions accurately.
+
+INVESTOR'S STRATEGY CONTEXT:
+{strategy_preamble or "(no strategy preamble provided)"}
+
+THE THESIS:
+## Thesis: {thesis['title']}
+
+{thesis['body']}
+
+YOUR PRIOR ANALYSIS OF THIS THESIS (steel man, devil's advocate, suggested indexes/stocks, notes):
+{analysis_text}
+
+LIVE PRICES for the tickers surfaced above — these are real, fetched just now:
+{price_table}
+
+YOUR JOB: produce ONLY the three sections below. Do not repeat the analysis. Build everything from the tickers in the LIVE PRICES table — do not introduce tickers that aren't priced there.
+
 ### Mock Portfolio (~${MOCK_PORTFOLIO_USD:,} hypothetical — educational, not financial advice)
-Construct ONE balanced hypothetical ${MOCK_PORTFOLIO_USD:,} allocation that expresses this thesis. Build it from the tickers you surfaced in Indexes/Stocks above (their live price and 52-week context is in the tables there). Present it as a **Markdown table** — NOT a yaml block — with columns: `Ticker | Role | Allocation | Weight | Rationale`. End with a **Total** row that sums to ≈ ${MOCK_PORTFOLIO_USD:,}.
+Construct ONE balanced hypothetical ${MOCK_PORTFOLIO_USD:,} allocation that expresses this thesis, sized against the live prices above. Present it as a **Markdown table** with columns: `Ticker | Role | Shares | Price | Allocation | Weight | Rationale`.
+- Compute `Shares = floor(Allocation / Price)` and set `Allocation = Shares × Price` (a small uninvested cash remainder is expected and fine).
+- End with a **Total** row that sums the actual Allocation column to ≈ ${MOCK_PORTFOLIO_USD:,}, and note any leftover cash.
 - `Role` is one of: `core`, `speculative`, `hedge`, `overlay`.
   - `core` = liquid, lower-variance expression of the thesis (the anchor).
   - `speculative` = concentrated, catalyst-direct, higher-variance satellite.
   - `hedge` = offsets a specific risk in the book.
-  - `overlay` = an OPTIONAL small options sleeve (e.g. calls/puts on a core name) — at most one, kept modest.
+  - `overlay` = an OPTIONAL small options sleeve (e.g. calls/puts on a core name) — at most one, kept modest. An options overlay has no live share price; size it by dollar premium, put "—" in the Shares/Price columns, and note the premium is an estimate.
 - Aim for genuine balance: a core anchor, one or two speculative satellites, and an optional small overlay — sized to each leg's conviction and risk, not split evenly by default.
+- If a ticker from your analysis has no row in the LIVE PRICES table, do not use it; if that leaves a gap, say so in one line under the table.
 
 ### Scenario Matrix
 A **Markdown table** with columns: `Scenario | What it looks like | Portfolio impact`. Cover at least three rows: the thesis plays out, a partial / delayed outcome, and the thesis failing or being invalidated.
 
 ### Trigger Logic
-The key catalyst date(s) and the specific conditions that would make you ADD, TRIM, or EXIT each leg. Be concrete about dates and price/event thresholds wherever the thesis provides them.
+The key catalyst date(s) and the specific conditions that would make you ADD, TRIM, or EXIT each leg. Be concrete about dates and price/event thresholds, using the live prices above as reference levels where useful.
 
-CRITICAL FORMATTING RULES:
-- The yaml blocks must use plain ASCII tickers (e.g. NVDA, SMH, TLRY). For non-US listings, use the full Yahoo-Finance-style symbol (e.g. TLRY.TO, SHOP.TO, ASML.AS).
-- Do not put commentary inside the yaml blocks — only the ticker lists.
-- If a side is empty (e.g. no clear downside indexes), use an empty list `[]`, do not omit the key.
-- The Mock Portfolio and Scenario Matrix MUST be Markdown tables, never yaml — only the Indexes and Stocks lists use yaml.
+CRITICAL: The Mock Portfolio and Scenario Matrix MUST be Markdown tables, never yaml.
 """
 
 
@@ -475,7 +550,323 @@ CRITICAL FORMATTING RULES:
 """
 
 
+# ── History, performance & calibration ──────────────────────────────────────
+#
+# Each report writes a structured sidecar (reports/{date}_research.json) capturing,
+# per thesis: conviction (1-5) + direction, catalysts, the mock-portfolio holdings
+# with entry prices, the realized weekly return of the PRIOR week's holdings, and a
+# running time-weighted equity index (100 at inception). This single store powers
+# both week-over-week continuity (#3) and the backtest ledger / calibration (#5).
+# Theses are matched across weeks by a normalized title key.
+
+CALIBRATION_MIN_PAIRS = 8  # need this many conviction→next-week-return pairs before reporting calibration
+
+
+def thesis_key(title: str) -> str:
+    """Normalize a thesis title into a stable key for week-over-week matching."""
+    return re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+
+
+def _to_float(s):
+    """Lenient float parse: strips $ , % and whitespace; returns None on failure."""
+    try:
+        return float(str(s).replace("$", "").replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def split_meta_block(response: str) -> tuple[dict | None, str]:
+    """Find the ```yaml block carrying conviction metadata (the one with a
+    'conviction' key), parse it, and strip it from the text. Returns
+    (meta_or_None, cleaned_text). Run BEFORE ticker extraction/rendering so the
+    metadata never pollutes ticker parsing or the visible report."""
+    for m in YAML_BLOCK_RE.finditer(response):
+        try:
+            data = yaml.safe_load(m.group(1))
+        except yaml.YAMLError:
+            continue
+        if isinstance(data, dict) and "conviction" in data:
+            cleaned = (response[: m.start()] + response[m.end():]).strip()
+            return data, cleaned
+    return None, response
+
+
+def normalize_meta(meta: dict | None) -> dict:
+    """Coerce a raw meta block into a clean, JSON-safe record."""
+    meta = meta or {}
+    try:
+        conv = int(meta.get("conviction"))
+    except (TypeError, ValueError):
+        conv = None
+    cats = []
+    for c in (meta.get("catalysts") or []):
+        if isinstance(c, dict):
+            cats.append({"date": str(c.get("date", "")), "what": str(c.get("what", ""))})
+    return {
+        "conviction": conv,
+        "direction": str(meta.get("direction", "n/a")).lower(),
+        "conviction_note": str(meta.get("conviction_note", "") or ""),
+        "catalysts": cats,
+    }
+
+
+def parse_portfolio_table(portfolio_md: str) -> list[dict]:
+    """Parse holdings out of the pass-2 Mock Portfolio markdown table. Returns
+    [{ticker, role, shares, entry_price, weight_pct, is_option}]. Skips the header,
+    separator, and Total rows. Rows with '—'/blank shares or price are options
+    (excluded from P&L)."""
+    m = re.search(r"#{2,4}\s*Mock Portfolio.*?\n(.*?)(?:\n#{2,4}\s|\Z)",
+                  portfolio_md, re.DOTALL | re.IGNORECASE)
+    region = m.group(1) if m else portfolio_md
+    holdings: list[dict] = []
+    for line in region.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 6:
+            continue
+        first = cells[0].lower()
+        if first in ("ticker", "") or set(cells[0]) <= set("-: "):  # header / separator
+            continue
+        if "total" in first:
+            continue
+        shares_s, price_s = cells[2].strip("* `"), cells[3].strip("* `")
+        is_option = (shares_s in ("—", "-", "") or price_s in ("—", "-", ""))
+        entry_price = _to_float(price_s)
+        ticker_raw = cells[0].strip("* `").strip()
+        holdings.append({
+            "ticker": ticker_raw.upper() if not is_option else ticker_raw,
+            "role": cells[1].strip("* `").lower(),
+            "shares": _to_float(shares_s),
+            "entry_price": entry_price,
+            "weight_pct": _to_float(cells[5].strip("* `")),
+            "is_option": bool(is_option) or entry_price is None,
+        })
+    return holdings
+
+
+def load_prior_state(key: str, before_date: str) -> tuple[str, dict] | None:
+    """Most recent sidecar (date < before_date) that contains this thesis key.
+    Returns (prior_report_date, thesis_record) or None."""
+    dated = sorted(
+        (p.name[:10], p) for p in REPORTS_DIR.glob("*_research.json")
+        if len(p.name[:10]) == 10 and p.name[:10] < before_date
+    )
+    for d, p in reversed(dated):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        for rec in data.get("theses", []):
+            if rec.get("key") == key:
+                return d, rec
+    return None
+
+
+def compute_weekly_return(prior_holdings: list[dict], enrichment: dict) -> tuple[list[dict], float | None]:
+    """Mark prior holdings to current prices. Returns (legs, weekly_return).
+    Excludes option legs and legs with no current/entry price; renormalizes weights
+    across the priced equity legs. weekly_return is None if nothing is priceable."""
+    legs, total_w = [], 0.0
+    for h in prior_holdings:
+        entry = h.get("entry_price")
+        info = enrichment.get((h.get("ticker") or "").upper())
+        if h.get("is_option"):
+            legs.append({**h, "status": "option (excluded)"})
+        elif entry in (None, 0) or not _is_priced(info):
+            legs.append({**h, "status": "no current price (excluded)"})
+        else:
+            w = h.get("weight_pct") or 0.0
+            total_w += w
+            legs.append({**h, "now": info["price"], "ret": info["price"] / entry - 1.0, "status": "ok"})
+    if total_w <= 0:
+        return legs, None
+    weekly = sum(l["ret"] * (l["weight_pct"] or 0.0) for l in legs if l["status"] == "ok") / total_w
+    return legs, weekly
+
+
+def build_prior_context(prior_date: str, rec: dict, today: str) -> str:
+    """Compact continuity block injected into the pass-1 analysis prompt."""
+    lines = [f"CONTINUITY — your prior take on this thesis (from {prior_date}):",
+             f"- Prior conviction: {rec.get('conviction')}/5 — \"{rec.get('conviction_note') or ''}\""]
+    cats = rec.get("catalysts") or []
+    if cats:
+        parts = []
+        for c in cats:
+            d, what = str(c.get("date", "")), c.get("what", "")
+            tag = " (NOW PAST — assess what happened)" if d and d <= today else " (upcoming)"
+            parts.append(f"{d} {what}{tag}".strip())
+        lines.append("- Catalysts you flagged: " + "; ".join(parts))
+    held = [f"{h['ticker']} ${h['entry_price']:.2f} ({h.get('role', '')})"
+            for h in (rec.get("holdings") or []) if not h.get("is_option") and h.get("entry_price")]
+    if held:
+        lines.append("- Prior mock-portfolio holdings (entry prices): " + ", ".join(held))
+    lines.append("Use WebSearch to determine what actually changed since then.")
+    return "\n".join(lines)
+
+
+def render_conviction_line(meta: dict, prior_conv: int | None) -> str:
+    conv = meta.get("conviction")
+    conv_s = f"{conv}/5" if conv is not None else "n/a"
+    if conv is not None and prior_conv is not None:
+        tag = (f"↑ from {prior_conv} last week" if conv > prior_conv
+               else f"↓ from {prior_conv} last week" if conv < prior_conv
+               else f"unchanged at {prior_conv}")
+    else:
+        tag = "first read"
+    note = meta.get("conviction_note") or ""
+    return f"**Conviction: {conv_s}** ({tag})" + (f" — _{note}_" if note else "")
+
+
+def render_performance_block(prior_date, legs, weekly_return, equity_index, inception_date) -> str:
+    if not legs:
+        return ("### Portfolio performance\n\n"
+                "_First tracked week — week-over-week performance starts next report._")
+    head = ["| Ticker | Entry | Now | Δ% | Weight |", "|--------|-------|-----|-----|--------|"]
+    rows = []
+    for l in legs:
+        w = l.get("weight_pct") or 0.0
+        if l.get("status") == "ok":
+            rows.append(f"| {l['ticker']} | ${l['entry_price']:.2f} | ${l['now']:.2f} | "
+                        f"{l['ret'] * 100:+.1f}% | {w:.0f}% |")
+        else:
+            entry = f"${l['entry_price']:.2f}" if l.get("entry_price") else "—"
+            rows.append(f"| {l['ticker']} | {entry} | — | _{l.get('status', '')}_ | {w:.0f}% |")
+    wk = f"{weekly_return * 100:+.1f}%" if weekly_return is not None else "n/a"
+    summary = (f"\n\n**Thesis weekly return:** {wk} (prior portfolio from {prior_date}) · "
+               f"**Since inception ({inception_date}):** {equity_index - 100:+.1f}% "
+               f"(index {equity_index:.1f})")
+    return "### Portfolio performance\n\n" + "\n".join(head + rows) + summary
+
+
+def compute_and_render(results: list[dict], enrichment: dict, report_date: str) -> tuple[list[str], list[dict]]:
+    """Shared post-processing for both flows. For each normalized thesis result
+    {key, title, meta, holdings, rendered_analysis, portfolio_text}, compute the
+    week-over-week performance + running equity index, render the full section, and
+    build the sidecar record. Returns (sections aligned to results, sidecar records)."""
+    sections, records = [], []
+    for r in results:
+        key, title, meta = r["key"], r["title"], r["meta"]
+        prior = load_prior_state(key, report_date)
+        if prior:
+            prior_date, prec = prior
+            legs, weekly = compute_weekly_return(prec.get("holdings", []), enrichment)
+            prior_index = prec.get("equity_index") or 100.0
+            equity_index = prior_index * (1 + weekly) if weekly is not None else prior_index
+            inception_date = prec.get("inception_date") or prior_date
+            prior_conv = prec.get("conviction")
+        else:
+            prior_date, legs, weekly = None, [], None
+            equity_index, inception_date, prior_conv = 100.0, report_date, None
+
+        perf = render_performance_block(prior_date, legs, weekly, equity_index, inception_date)
+        conv_line = render_conviction_line(meta, prior_conv)
+        sections.append(
+            f"## Thesis: {title}\n\n{conv_line}\n\n"
+            f"{r['rendered_analysis']}\n\n{r['portfolio_text']}\n\n{perf}"
+        )
+        records.append({
+            "key": key, "title": title, "inception_date": inception_date,
+            "conviction": meta["conviction"], "direction": meta["direction"],
+            "conviction_note": meta["conviction_note"], "catalysts": meta["catalysts"],
+            "holdings": r["holdings"], "weekly_return": weekly,
+            "equity_index": round(equity_index, 4), "prior_report_date": prior_date,
+        })
+    return sections, records
+
+
+def render_calibration_section(current_records: list[dict], report_date: str) -> str:
+    """Book-level ledger + conviction calibration, reading all past sidecars plus
+    this run's in-memory records. Calibration pairs conviction[T] with the realized
+    weekly_return[T+1] of the same thesis."""
+    timeline: dict[str, list[tuple[str, dict]]] = {}
+
+    def _add(d, recs):
+        for rec in recs:
+            if rec.get("key"):
+                timeline.setdefault(rec["key"], []).append((d, rec))
+
+    for p in sorted(REPORTS_DIR.glob("*_research.json")):
+        d = p.name[:10]
+        if not (len(d) == 10 and d < report_date):
+            continue
+        try:
+            _add(d, json.loads(p.read_text(encoding="utf-8")).get("theses", []))
+        except (json.JSONDecodeError, OSError):
+            continue
+    _add(report_date, current_records)
+    for items in timeline.values():
+        items.sort(key=lambda t: t[0])
+
+    ledger = []
+    for k, items in sorted(timeline.items()):
+        _, rec = items[-1]
+        wk, eq = rec.get("weekly_return"), rec.get("equity_index")
+        wk_s = f"{wk * 100:+.1f}%" if isinstance(wk, (int, float)) else "—"
+        si_s = f"{eq - 100:+.1f}%" if isinstance(eq, (int, float)) else "—"
+        conv = rec.get("conviction")
+        ledger.append(f"| {rec.get('title', k)} | {conv if conv is not None else '—'}/5 | {wk_s} | {si_s} |")
+
+    buckets: dict[int, list[float]] = {c: [] for c in range(1, 6)}
+    pairs = 0
+    for items in timeline.values():
+        for (_, r0), (_, r1) in zip(items, items[1:]):
+            c, ret = r0.get("conviction"), r1.get("weekly_return")
+            if isinstance(c, int) and c in buckets and isinstance(ret, (int, float)):
+                buckets[c].append(ret)
+                pairs += 1
+
+    out = ["## Conviction Calibration & Ledger", "",
+           "_Educational backtest of the hypothetical mock portfolios — not financial advice._", "",
+           "### Ledger (latest per thesis)", "",
+           "| Thesis | Conviction | Last weekly return | Since inception |",
+           "|--------|-----------|--------------------|-----------------|"]
+    out += ledger or ["| _no theses tracked yet_ | — | — | — |"]
+    out += ["", "### Conviction calibration", ""]
+    if pairs < CALIBRATION_MIN_PAIRS:
+        out.append(f"_Insufficient history to assess calibration ({pairs}/{CALIBRATION_MIN_PAIRS} "
+                   "conviction→return pairs). Builds up as more weekly reports accrue._")
+    else:
+        out += ["Average *subsequent-week* return of the prior portfolio, bucketed by the "
+                "conviction recorded the week before:", "",
+                "| Conviction | Avg next-week return | Samples |",
+                "|-----------|----------------------|---------|"]
+        for c in range(5, 0, -1):
+            vals = buckets[c]
+            if vals:
+                out.append(f"| {c}/5 | {sum(vals) / len(vals) * 100:+.1f}% | {len(vals)} |")
+        out.append(f"\n_Based on {pairs} conviction→return pairs across {len(timeline)} theses._")
+    return "\n".join(out)
+
+
+def write_sidecar(report_date: str, records: list[dict]) -> None:
+    """Persist the structured per-thesis history sidecar next to the report."""
+    payload = {"report_date": report_date,
+               "generated_at": datetime.now(ET).isoformat(),
+               "theses": records}
+    _write_json_atomic(REPORTS_DIR / f"{report_date}_research.json", payload)
+
+
 # ── Main flow ───────────────────────────────────────────────────────────────
+
+def build_portfolio_section(strategy_preamble: str, thesis: dict, analysis_text: str,
+                            enrichment: dict) -> str:
+    """Pass 2: build the price-grounded portfolio / scenario / trigger section from the
+    pass-1 analysis and freshly enriched prices. Returns a placeholder (no Claude call)
+    when nothing priced, so a thesis with all-bad tickers still renders cleanly."""
+    priced = sum(1 for info in enrichment.values() if _is_priced(info))
+    if not priced:
+        return ("### Mock Portfolio\n\n"
+                "> ⚠ No live prices were available for the suggested tickers, so a "
+                "price-grounded portfolio could not be built this run.")
+    print(f"[{_ts()}]   Pass 2: sizing portfolio from {priced} priced ticker(s)")
+    price_table = format_enrichment_table(enrichment)
+    return call_claude(
+        build_portfolio_prompt(strategy_preamble, thesis, analysis_text, price_table),
+        allow_web=False,
+    )
+
 
 def run(args: argparse.Namespace) -> str:
     theses_path = Path(args.theses) if args.theses else DEFAULT_THESES_FILE
@@ -503,38 +894,59 @@ def run(args: argparse.Namespace) -> str:
         print(f"[{_ts()}] Filter matched {len(theses)} thesis/theses.")
 
     allow_web = not args.no_web
-    sections: list[str] = []
+    report_date = date.today().isoformat()
+    results: list[dict] = []
+    combined_enrichment: dict = {}
 
     for i, thesis in enumerate(theses, 1):
+        key = thesis_key(thesis["title"])
         print(f"[{_ts()}] [{i}/{len(theses)}] Researching: {thesis['title']!r}")
-        prompt = build_thesis_prompt(preamble, thesis, allow_web)
-        response = call_claude(prompt, allow_web=allow_web)
-        tickers = extract_tickers_from_response(response)
-        enrichment = enrich_tickers(tickers)
-        rendered = replace_yaml_blocks_with_tables(response, enrichment)
-        sections.append(f"## Thesis: {thesis['title']}\n\n{rendered}")
+        prior = load_prior_state(key, report_date)
+        prior_context = build_prior_context(prior[0], prior[1], report_date) if prior else None
+        if prior_context:
+            print(f"[{_ts()}]   Continuity: threading in prior take from {prior[0]}.")
+        analysis_raw = call_claude(
+            build_analysis_prompt(preamble, thesis, allow_web, prior_context), allow_web=allow_web)
+        meta, analysis = split_meta_block(analysis_raw)
+        tickers = extract_tickers_from_response(analysis)
+        prior_tickers = [h["ticker"] for h in (prior[1].get("holdings") if prior else [])
+                         if not h.get("is_option")]
+        enrichment = enrich_tickers(tickers + prior_tickers)
+        combined_enrichment.update(enrichment)
+        rendered = replace_yaml_blocks_with_tables(analysis, enrichment)
+        portfolio = build_portfolio_section(preamble, thesis, analysis, enrichment)
+        results.append({
+            "key": key, "title": thesis["title"], "meta": normalize_meta(meta),
+            "holdings": parse_portfolio_table(portfolio),
+            "rendered_analysis": rendered, "portfolio_text": portfolio,
+        })
+
+    sections, records = compute_and_render(results, combined_enrichment, report_date)
 
     if not args.skip_new_thesis_scan and not args.thesis:
         print(f"[{_ts()}] Running new-thesis scan...")
         prompt = build_new_thesis_prompt(preamble, [t["title"] for t in theses], allow_web)
         response = call_claude(prompt, allow_web=allow_web)
-        tickers = extract_tickers_from_response(response)
-        enrichment = enrich_tickers(tickers)
-        rendered = replace_yaml_blocks_with_tables(response, enrichment)
-        sections.append(rendered)
+        enrichment = enrich_tickers(extract_tickers_from_response(response))
+        sections.append(replace_yaml_blocks_with_tables(response, enrichment))
 
-    today = date.today().isoformat()
-    header = f"# Market Research — {today}\n\n_Generated {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} from {theses_path.name}_\n"
-    body = "\n\n---\n\n".join(sections)
-    report = f"{header}\n{body}\n"
+    sections.append(render_calibration_section(records, report_date))
+
+    header = (f"# Market Research — {report_date}\n\n"
+              f"_Generated {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} from {theses_path.name}_\n")
+    report = f"{header}\n" + "\n\n---\n\n".join(sections) + "\n"
 
     if args.test:
         print(f"[{_ts()}] Test mode — not saving.")
     else:
         REPORTS_DIR.mkdir(exist_ok=True)
-        out = REPORTS_DIR / f"{today}_research.md"
+        out = REPORTS_DIR / f"{report_date}_research.md"
         out.write_text(report, encoding="utf-8")
-        print(f"[{_ts()}] Report saved → {out}")
+        if args.thesis:
+            print(f"[{_ts()}] Report saved → {out} (filtered run — history sidecar not written).")
+        else:
+            write_sidecar(report_date, records)
+            print(f"[{_ts()}] Report saved → {out} (+ history sidecar).")
 
     return report
 
@@ -572,13 +984,18 @@ def load_manifest(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def save_manifest(path: Path, manifest: dict) -> None:
-    """Write atomically (temp + replace) so an interrupted scheduled run can't
-    leave a half-written manifest."""
+def _write_json_atomic(path: Path, obj) -> None:
+    """Write JSON via temp file + os.replace so an interrupted run can't leave a
+    half-written file behind."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def save_manifest(path: Path, manifest: dict) -> None:
+    """Write the batch manifest atomically (see _write_json_atomic)."""
+    _write_json_atomic(path, manifest)
 
 
 def create_manifest(theses_path: Path, monday: date) -> dict:
@@ -595,7 +1012,9 @@ def create_manifest(theses_path: Path, monday: date) -> dict:
             "status": "pending",       # pending | done
             "attempts": 0,
             "last_error": None,
-            "raw_response": None,
+            "raw_response": None,        # legacy single-pass field; unused for theses now
+            "analysis_response": None,   # pass 1: steel-man/devil's/indexes/stocks/notes
+            "portfolio_response": None,  # pass 2: price-grounded portfolio/scenario/triggers
             "researched_at": None,
         })
     units.append({
@@ -659,19 +1078,30 @@ def run_research_next(args: argparse.Namespace) -> None:
     print(f"[{_ts()}] Researching {unit['id']}: {label!r} "
           f"(attempt {unit['attempts'] + 1}/{MAX_ATTEMPTS})")
 
-    if unit["kind"] == "thesis":
-        prompt = build_thesis_prompt(
-            manifest["strategy_preamble"],
-            {"title": unit["title"], "body": unit["body"]},
-            allow_web,
-        )
-    else:
-        existing = [u["title"] for u in manifest["units"] if u["kind"] == "thesis"]
-        prompt = build_new_thesis_prompt(manifest["strategy_preamble"], existing, allow_web)
-
     unit["attempts"] += 1
+    preamble = manifest["strategy_preamble"]
+    report_date = manifest["batch_date"]
     try:
-        response = call_claude(prompt, allow_web=allow_web)
+        if unit["kind"] == "thesis":
+            # In-slot two-pass with week-over-week continuity:
+            #   prior context → research (web) → enrich → price-grounded portfolio.
+            thesis = {"title": unit["title"], "body": unit["body"]}
+            prior = load_prior_state(thesis_key(unit["title"]), report_date)
+            prior_context = build_prior_context(prior[0], prior[1], report_date) if prior else None
+            analysis_raw = call_claude(
+                build_analysis_prompt(preamble, thesis, allow_web, prior_context), allow_web=allow_web)
+            _, analysis = split_meta_block(analysis_raw)
+            tickers = extract_tickers_from_response(analysis)
+            prior_tickers = [h["ticker"] for h in (prior[1].get("holdings") if prior else [])
+                             if not h.get("is_option")]
+            enrichment = enrich_tickers(tickers + prior_tickers)
+            portfolio = build_portfolio_section(preamble, thesis, analysis, enrichment)
+            unit["analysis_response"] = analysis_raw   # raw (incl. meta block); assemble re-splits
+            unit["portfolio_response"] = portfolio
+        else:
+            existing = [u["title"] for u in manifest["units"] if u["kind"] == "thesis"]
+            unit["raw_response"] = call_claude(
+                build_new_thesis_prompt(preamble, existing, allow_web), allow_web=allow_web)
     except Exception as e:
         unit["last_error"] = str(e)[:1000]
         save_manifest(mpath, manifest)
@@ -680,7 +1110,6 @@ def run_research_next(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     unit["status"] = "done"
-    unit["raw_response"] = response
     unit["researched_at"] = datetime.now(ET).isoformat()
     unit["last_error"] = None
     save_manifest(mpath, manifest)
@@ -706,32 +1135,63 @@ def run_assemble(args: argparse.Namespace) -> None:
     print(f"[{_ts()}] Assembling batch {manifest['batch_date']}: "
           f"{len(done)}/{len(units)} units researched.")
 
-    # Enrich every ticker across the whole batch in one pass — all prices share
-    # one Monday snapshot rather than drifting across the weekend's runs.
+    report_date = manifest["batch_date"]
+
+    # Pass A — parse stored responses and gather every ticker (current + prior
+    # holdings + scan) so the whole batch shares one Monday price snapshot.
     all_tickers: list[str] = []
+    parsed: dict[str, dict] = {}
     for u in done:
-        all_tickers += extract_tickers_from_response(u["raw_response"])
+        if u["kind"] == "thesis":
+            meta, cleaned = split_meta_block(u.get("analysis_response") or u.get("raw_response") or "")
+            prior = load_prior_state(thesis_key(u["title"]), report_date)
+            parsed[u["id"]] = {
+                "meta": meta, "cleaned": cleaned,
+                "holdings": parse_portfolio_table(u.get("portfolio_response") or ""), "prior": prior,
+            }
+            all_tickers += extract_tickers_from_response(cleaned)
+            all_tickers += [h["ticker"] for h in (prior[1].get("holdings") if prior else [])
+                            if not h.get("is_option")]
+        else:
+            all_tickers += extract_tickers_from_response(u.get("raw_response") or "")
     enrichment = enrich_tickers(all_tickers)
 
+    # Pass B — normalize done thesis units (unit order) and render their sections.
+    results: list[dict] = []
+    for u in units:
+        if u["status"] == "done" and u["kind"] == "thesis":
+            p = parsed[u["id"]]
+            portfolio = u.get("portfolio_response") or ""
+            if u.get("researched_at"):
+                portfolio = f"_Portfolio priced as of {u['researched_at']}._\n\n{portfolio}"
+            results.append({
+                "unit_id": u["id"], "key": thesis_key(u["title"]), "title": u["title"],
+                "meta": normalize_meta(p["meta"]), "holdings": p["holdings"],
+                "rendered_analysis": replace_yaml_blocks_with_tables(p["cleaned"], enrichment),
+                "portfolio_text": portfolio,
+            })
+    thesis_sections, records = compute_and_render(results, enrichment, report_date)
+    sec_by_id = {r["unit_id"]: s for r, s in zip(results, thesis_sections)}
+
+    # Pass C — stitch in unit order, weaving placeholders + scan back in.
     sections: list[str] = []
     for u in units:
         if u["status"] == "done":
-            rendered = replace_yaml_blocks_with_tables(u["raw_response"], enrichment)
             if u["kind"] == "thesis":
-                sections.append(f"## Thesis: {u['title']}\n\n{rendered}")
+                sections.append(sec_by_id[u["id"]])
             else:
-                sections.append(rendered)
+                sections.append(replace_yaml_blocks_with_tables(u.get("raw_response") or "", enrichment))
         else:
             err = f" Last error: {u['last_error']}" if u.get("last_error") else ""
-            placeholder = (f"> ⚠ Not researched this batch — "
-                           f"{u['attempts']} attempt(s).{err}")
+            placeholder = f"> ⚠ Not researched this batch — {u['attempts']} attempt(s).{err}"
             if u["kind"] == "thesis":
                 sections.append(f"## Thesis: {u['title']}\n\n{placeholder}")
             else:
                 sections.append(f"## Suggested new theses\n\n{placeholder}")
 
-    batch_date = manifest["batch_date"]
-    header = (f"# Market Research — {batch_date}\n\n"
+    sections.append(render_calibration_section(records, report_date))
+
+    header = (f"# Market Research — {report_date}\n\n"
               f"_Weekend batch assembled {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} "
               f"from {manifest['theses_source']} · "
               f"{len(done)}/{len(units)} units researched_\n")
@@ -745,9 +1205,10 @@ def run_assemble(args: argparse.Namespace) -> None:
         return
 
     REPORTS_DIR.mkdir(exist_ok=True)
-    out = REPORTS_DIR / f"{batch_date}_research.md"
+    out = REPORTS_DIR / f"{report_date}_research.md"
     out.write_text(report, encoding="utf-8")
-    print(f"[{_ts()}] Report saved → {out}")
+    write_sidecar(report_date, records)
+    print(f"[{_ts()}] Report saved → {out} (+ history sidecar).")
 
     # Archive the manifest so next weekend starts a fresh batch.
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
