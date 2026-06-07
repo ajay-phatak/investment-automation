@@ -1054,6 +1054,15 @@ def run_research_next(args: argparse.Namespace) -> None:
     monday = upcoming_monday()
     mpath = manifest_path(monday)
 
+    # Completion guard: once this week's report exists the batch is finished.
+    # Auto-assembly (below) archives the manifest when the last unit completes,
+    # so without this a later slot would create a fresh manifest and re-research
+    # everything. This makes surplus weekend slots no-op after the report is out.
+    report_out = REPORTS_DIR / f"{monday.isoformat()}_research.md"
+    if report_out.exists():
+        print(f"[{_ts()}] Report for {monday.isoformat()} already assembled — slot is a no-op.")
+        return
+
     if mpath.exists():
         manifest = load_manifest(mpath)
         print(f"[{_ts()}] Resuming batch {manifest['batch_date']} ({mpath.name}).")
@@ -1068,9 +1077,16 @@ def run_research_next(args: argparse.Namespace) -> None:
 
     unit = _next_unit(manifest)
     if unit is None:
+        # Nothing left worth attempting but the report isn't out yet (e.g. a prior
+        # slot finished the last unit but crashed before assembling). Recover by
+        # assembling now instead of idling until Monday.
         done = sum(1 for u in manifest["units"] if u["status"] == "done")
         total = len(manifest["units"])
-        print(f"[{_ts()}] Nothing pending ({done}/{total} done) — slot is a no-op.")
+        if args.test:
+            print(f"[{_ts()}] Nothing pending ({done}/{total} done) — slot is a no-op (test).")
+        else:
+            print(f"[{_ts()}] Nothing pending ({done}/{total} done) — assembling now.")
+            run_assemble(args)
         return
 
     allow_web = not args.no_web
@@ -1115,6 +1131,17 @@ def run_research_next(args: argparse.Namespace) -> None:
     save_manifest(mpath, manifest)
     remaining = sum(1 for u in manifest["units"] if u["status"] == "pending")
     print(f"[{_ts()}] {unit['id']} done. {remaining} unit(s) still pending.")
+
+    # The new-thesis scan is always the last unit, so finishing the batch means
+    # the whole report is ready. Assemble immediately rather than waiting for the
+    # Monday task — a 2-thesis book is done Saturday evening. (Monday stays a
+    # fallback for batches a weekend slot never managed to complete.)
+    if _next_unit(manifest) is None and not args.test:
+        if all(u["status"] == "done" for u in manifest["units"]):
+            print(f"[{_ts()}] Batch complete — assembling now (not waiting for Monday).")
+        else:
+            print(f"[{_ts()}] No retriable units left — assembling available units now.")
+        run_assemble(args)
 
 
 def run_assemble(args: argparse.Namespace) -> None:

@@ -100,9 +100,12 @@ A typical run takes 5–15 minutes depending on thesis count and web-search dept
 
 Running everything at once does one Claude call per thesis back-to-back, which
 spikes the Claude Code subscription's rolling 5-hour quota hard. Weekend-batch
-mode spreads the work out: each scheduled run researches **one** thesis, saves
-the result, and a Monday step assembles the finished report. Same model, same
-prompts, same web research — only the *timing* changes.
+mode spreads the work out: each scheduled run researches **one** thesis and saves
+the result. The slot that finishes the **last** unit (the new-thesis scan always
+runs last) assembles the finished report on the spot — so a small book is done the
+same evening rather than waiting for Monday. A Monday step remains as a fallback
+for batches a weekend slot never managed to complete. Same model, same prompts,
+same web research — only the *timing* changes.
 
 ```bash
 python thesis_research.py --research-next   # research the next pending unit, then exit
@@ -116,11 +119,14 @@ How it works:
   can't corrupt an in-progress batch. Each subsequent run picks the next pending
   thesis (the new-thesis scan runs last) and fully finishes it — a web research
   pass plus a price-grounded portfolio pass — recording both. A failed call leaves
-  the unit pending and a later run retries it from the top.
-- `--assemble` reads the manifest, enriches every ticker in one pass (so all
-  prices share one Monday snapshot), writes `reports/{Monday}_research.md`, and
-  archives the manifest. Theses that never completed are flagged in the report
-  rather than blocking it.
+  the unit pending and a later run retries it from the top. **When that run
+  finishes the last unit it assembles the report automatically** — no need to wait
+  for Monday. Once the report exists, surplus weekend slots see it and no-op.
+- `--assemble` (run automatically by the finishing slot, and again by the Monday
+  fallback task) reads the manifest, enriches every ticker in one pass (so all
+  prices share one snapshot), writes `reports/{Monday}_research.md`, and archives
+  the manifest. Theses that never completed are flagged in the report rather than
+  blocking it. If the report is already assembled it's a clean no-op.
 
 ### Scheduling it
 
@@ -133,7 +139,11 @@ powershell -ExecutionPolicy Bypass -File setup_schedule.ps1
 | Task | When | Runs |
 |------|------|------|
 | `ThesisResearch-Weekend` | Sat 06:00, 09:00, 12:00, 15:00, 18:00, 21:00; Sun 09:00, 12:00 | `run_research_next.bat` |
-| `ThesisResearch-Assemble` | Mon 07:00 | `run_assemble.bat` |
+| `ThesisResearch-Assemble` | Mon 07:00 (fallback) | `run_assemble.bat` |
+
+The report normally assembles itself the moment the last weekend slot finishes;
+the Monday task only does work if no weekend slot completed the batch (e.g. the
+machine was asleep for the finishing slot).
 
 Eight weekend slots, ~3 hours apart — so any rolling 5-hour quota window touches
 at most ~2 theses. Each thesis now makes two Claude calls (research + portfolio;
