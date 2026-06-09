@@ -64,7 +64,7 @@ ALPACA_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET = os.environ.get("ALPACA_API_SECRET")
 ALPACA_FEED = os.environ.get("ALPACA_FEED", "iex").lower()
 
-CLAUDE_MODEL = "claude-opus-4-8"
+CLAUDE_MODEL = "claude-fable-5"
 # Web research is materially slower than the price-only brief — give it room.
 CLAUDE_TIMEOUT_SEC = 900
 
