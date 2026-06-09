@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -60,6 +61,28 @@ ARCHIVE_DIR = PARTIAL_DIR / "archive"
 MAX_ATTEMPTS = 3
 ET = ZoneInfo("America/New_York")
 
+
+def _load_dotenv(path: Path) -> None:
+    """Minimal .env loader (KEY=VALUE lines, # comments, optional quotes).
+    Values already present in the environment win, so a shell-exported key
+    overrides the file. Scheduled-task runs don't inherit user shell exports,
+    so without this the Alpaca keys were never seen by unattended runs."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip("'\"")
+        if key and value and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv(SCRIPT_DIR / ".env")
+
 ALPACA_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET = os.environ.get("ALPACA_API_SECRET")
 ALPACA_FEED = os.environ.get("ALPACA_FEED", "iex").lower()
@@ -71,6 +94,11 @@ CLAUDE_TIMEOUT_SEC = 900
 # Each thesis gets a hypothetical, educational mock portfolio of this size.
 # One-line edit to change it — applies to both the all-at-once and weekend runs.
 MOCK_PORTFOLIO_USD = 5000
+
+# Benchmark for performance comparison. Always enriched alongside thesis tickers;
+# each sidecar record stores its price + a running benchmark index so every
+# weekly/since-inception number can be read against the market.
+BENCHMARK_TICKER = "SPY"
 
 
 # ── Claude Code CLI plumbing ────────────────────────────────────────────────
@@ -164,6 +192,8 @@ def _fetch_alpaca_52w(tickers: list[str]) -> dict:
     that came back with data."""
     out: dict[str, dict] = {}
     if not (ALPACA_KEY and ALPACA_SECRET):
+        print("  Alpaca credentials not set (ALPACA_API_KEY / ALPACA_API_SECRET, "
+              "via env or .env) — using yfinance for all tickers")
         return out
     try:
         from alpaca.data.historical import StockHistoricalDataClient
@@ -210,27 +240,46 @@ def _fetch_alpaca_52w(tickers: list[str]) -> dict:
     return out
 
 
+YF_ATTEMPTS = 3          # per-ticker tries before recording an error
+YF_BACKOFF_BASE_SEC = 2  # sleeps 2s, then 4s between retries
+
+
+def _yf_history_1y(ticker: str):
+    """Fetch ~1y of daily bars from yfinance with retry + backoff. Yahoo
+    intermittently rate-limits or returns empty frames; a couple of spaced
+    retries recovers most of those. Returns (history_df_or_None, error_or_None)."""
+    last_err = None
+    for attempt in range(YF_ATTEMPTS):
+        try:
+            hist = yf.Ticker(ticker).history(period="1y")
+            if not hist.empty:
+                return hist, None
+            last_err = "no data (delisted, OTC, or invalid?)"
+        except Exception as e:
+            last_err = str(e)
+        if attempt < YF_ATTEMPTS - 1:
+            time.sleep(YF_BACKOFF_BASE_SEC * (attempt + 1))
+    return None, last_err
+
+
 def _fetch_yfinance_52w(tickers: list[str]) -> dict:
     """yfinance fallback. Slower (one request per ticker) but covers OTC,
     foreign, and anything Alpaca rejects."""
     out: dict[str, dict] = {}
     for ticker in tickers:
-        try:
-            hist = yf.Ticker(ticker).history(period="1y")
-            if hist.empty:
-                out[ticker] = {"error": "no data (delisted, OTC, or invalid?)"}
-                continue
-            price = hist["Close"].iloc[-1]
-            high_52w = hist["High"].max()
-            low_52w = hist["Low"].min()
-            out[ticker] = {
-                "price": round(float(price), 4),
-                "low_52w": round(float(low_52w), 4),
-                "high_52w": round(float(high_52w), 4),
-                "source": "yfinance",
-            }
-        except Exception as e:
-            out[ticker] = {"error": str(e)}
+        hist, err = _yf_history_1y(ticker)
+        if hist is None:
+            out[ticker] = {"error": err}
+            continue
+        price = hist["Close"].iloc[-1]
+        high_52w = hist["High"].max()
+        low_52w = hist["Low"].min()
+        out[ticker] = {
+            "price": round(float(price), 4),
+            "low_52w": round(float(low_52w), 4),
+            "high_52w": round(float(high_52w), 4),
+            "source": "yfinance",
+        }
     return out
 
 
@@ -554,9 +603,11 @@ CRITICAL FORMATTING RULES:
 #
 # Each report writes a structured sidecar (reports/{date}_research.json) capturing,
 # per thesis: conviction (1-5) + direction, catalysts, the mock-portfolio holdings
-# with entry prices, the realized weekly return of the PRIOR week's holdings, and a
-# running time-weighted equity index (100 at inception). This single store powers
-# both week-over-week continuity (#3) and the backtest ledger / calibration (#5).
+# with entry prices, the realized weekly return of the PRIOR week's holdings, a
+# running time-weighted equity index (100 at inception), and a period-paired
+# benchmark (BENCHMARK_TICKER) price + index so performance reads against the
+# market. This single store powers both week-over-week continuity (#3) and the
+# backtest ledger / calibration (#5).
 # Theses are matched across weeks by a normalized title key.
 
 CALIBRATION_MIN_PAIRS = 8  # need this many conviction→next-week-return pairs before reporting calibration
@@ -719,7 +770,8 @@ def render_conviction_line(meta: dict, prior_conv: int | None) -> str:
     return f"**Conviction: {conv_s}** ({tag})" + (f" — _{note}_" if note else "")
 
 
-def render_performance_block(prior_date, legs, weekly_return, equity_index, inception_date) -> str:
+def render_performance_block(prior_date, legs, weekly_return, equity_index, inception_date,
+                             bench_weekly=None, bench_index=None) -> str:
     if not legs:
         return ("### Portfolio performance\n\n"
                 "_First tracked week — week-over-week performance starts next report._")
@@ -734,8 +786,11 @@ def render_performance_block(prior_date, legs, weekly_return, equity_index, ince
             entry = f"${l['entry_price']:.2f}" if l.get("entry_price") else "—"
             rows.append(f"| {l['ticker']} | {entry} | — | _{l.get('status', '')}_ | {w:.0f}% |")
     wk = f"{weekly_return * 100:+.1f}%" if weekly_return is not None else "n/a"
-    summary = (f"\n\n**Thesis weekly return:** {wk} (prior portfolio from {prior_date}) · "
-               f"**Since inception ({inception_date}):** {equity_index - 100:+.1f}% "
+    wk_b = f" (vs {BENCHMARK_TICKER} {bench_weekly * 100:+.1f}%)" if bench_weekly is not None else ""
+    si_b = (f" vs {BENCHMARK_TICKER} {bench_index - 100:+.1f}%"
+            if isinstance(bench_index, (int, float)) else "")
+    summary = (f"\n\n**Thesis weekly return:** {wk}{wk_b} (prior portfolio from {prior_date}) · "
+               f"**Since inception ({inception_date}):** {equity_index - 100:+.1f}%{si_b} "
                f"(index {equity_index:.1f})")
     return "### Portfolio performance\n\n" + "\n".join(head + rows) + summary
 
@@ -743,8 +798,15 @@ def render_performance_block(prior_date, legs, weekly_return, equity_index, ince
 def compute_and_render(results: list[dict], enrichment: dict, report_date: str) -> tuple[list[str], list[dict]]:
     """Shared post-processing for both flows. For each normalized thesis result
     {key, title, meta, holdings, rendered_analysis, portfolio_text}, compute the
-    week-over-week performance + running equity index, render the full section, and
-    build the sidecar record. Returns (sections aligned to results, sidecar records)."""
+    week-over-week performance + running equity index (and the matching benchmark
+    index), render the full section, and build the sidecar record. Returns
+    (sections aligned to results, sidecar records)."""
+    bench_info = enrichment.get(BENCHMARK_TICKER)
+    bench_now = bench_info["price"] if _is_priced(bench_info) else None
+    if bench_now is None:
+        print(f"[{_ts()}]   Warning: no live {BENCHMARK_TICKER} price — "
+              "benchmark comparison unavailable this run.")
+
     sections, records = [], []
     for r in results:
         key, title, meta = r["key"], r["title"], r["meta"]
@@ -756,11 +818,23 @@ def compute_and_render(results: list[dict], enrichment: dict, report_date: str) 
             equity_index = prior_index * (1 + weekly) if weekly is not None else prior_index
             inception_date = prec.get("inception_date") or prior_date
             prior_conv = prec.get("conviction")
+            # Benchmark over the same span: prior report's benchmark price → now.
+            # Only advance the benchmark index when the equity index also advanced,
+            # so the two stay period-paired and comparable.
+            prior_bench = (prec.get("benchmark_price")
+                           if prec.get("benchmark_ticker") == BENCHMARK_TICKER else None)
+            bench_index = prec.get("benchmark_index") or 100.0
+            bench_weekly = (bench_now / prior_bench - 1.0
+                            if bench_now and prior_bench else None)
+            if weekly is not None and bench_weekly is not None:
+                bench_index *= 1 + bench_weekly
         else:
             prior_date, legs, weekly = None, [], None
             equity_index, inception_date, prior_conv = 100.0, report_date, None
+            bench_weekly, bench_index = None, 100.0
 
-        perf = render_performance_block(prior_date, legs, weekly, equity_index, inception_date)
+        perf = render_performance_block(prior_date, legs, weekly, equity_index, inception_date,
+                                        bench_weekly, bench_index)
         conv_line = render_conviction_line(meta, prior_conv)
         sections.append(
             f"## Thesis: {title}\n\n{conv_line}\n\n"
@@ -772,6 +846,9 @@ def compute_and_render(results: list[dict], enrichment: dict, report_date: str) 
             "conviction_note": meta["conviction_note"], "catalysts": meta["catalysts"],
             "holdings": r["holdings"], "weekly_return": weekly,
             "equity_index": round(equity_index, 4), "prior_report_date": prior_date,
+            "benchmark_ticker": BENCHMARK_TICKER,
+            "benchmark_price": round(bench_now, 4) if bench_now is not None else None,
+            "benchmark_index": round(bench_index, 4),
         })
     return sections, records
 
@@ -803,10 +880,14 @@ def render_calibration_section(current_records: list[dict], report_date: str) ->
     for k, items in sorted(timeline.items()):
         _, rec = items[-1]
         wk, eq = rec.get("weekly_return"), rec.get("equity_index")
+        bi = rec.get("benchmark_index")
         wk_s = f"{wk * 100:+.1f}%" if isinstance(wk, (int, float)) else "—"
         si_s = f"{eq - 100:+.1f}%" if isinstance(eq, (int, float)) else "—"
+        rel_s = (f"{eq - bi:+.1f} pp"
+                 if isinstance(eq, (int, float)) and isinstance(bi, (int, float)) else "—")
         conv = rec.get("conviction")
-        ledger.append(f"| {rec.get('title', k)} | {conv if conv is not None else '—'}/5 | {wk_s} | {si_s} |")
+        ledger.append(f"| {rec.get('title', k)} | {conv if conv is not None else '—'}/5 | "
+                      f"{wk_s} | {si_s} | {rel_s} |")
 
     buckets: dict[int, list[float]] = {c: [] for c in range(1, 6)}
     pairs = 0
@@ -820,9 +901,9 @@ def render_calibration_section(current_records: list[dict], report_date: str) ->
     out = ["## Conviction Calibration & Ledger", "",
            "_Educational backtest of the hypothetical mock portfolios — not financial advice._", "",
            "### Ledger (latest per thesis)", "",
-           "| Thesis | Conviction | Last weekly return | Since inception |",
-           "|--------|-----------|--------------------|-----------------|"]
-    out += ledger or ["| _no theses tracked yet_ | — | — | — |"]
+           f"| Thesis | Conviction | Last weekly return | Since inception | vs {BENCHMARK_TICKER} |",
+           "|--------|-----------|--------------------|-----------------|--------|"]
+    out += ledger or ["| _no theses tracked yet_ | — | — | — | — |"]
     out += ["", "### Conviction calibration", ""]
     if pairs < CALIBRATION_MIN_PAIRS:
         out.append(f"_Insufficient history to assess calibration ({pairs}/{CALIBRATION_MIN_PAIRS} "
@@ -920,6 +1001,10 @@ def run(args: argparse.Namespace) -> str:
             "holdings": parse_portfolio_table(portfolio),
             "rendered_analysis": rendered, "portfolio_text": portfolio,
         })
+
+    # Benchmark for performance comparison — enrich it unless a thesis already did.
+    if not _is_priced(combined_enrichment.get(BENCHMARK_TICKER)):
+        combined_enrichment.update(enrich_tickers([BENCHMARK_TICKER]))
 
     sections, records = compute_and_render(results, combined_enrichment, report_date)
 
@@ -1181,6 +1266,7 @@ def run_assemble(args: argparse.Namespace) -> None:
                             if not h.get("is_option")]
         else:
             all_tickers += extract_tickers_from_response(u.get("raw_response") or "")
+    all_tickers.append(BENCHMARK_TICKER)  # benchmark shares the same price snapshot
     enrichment = enrich_tickers(all_tickers)
 
     # Pass B — normalize done thesis units (unit order) and render their sections.

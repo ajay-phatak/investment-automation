@@ -1,3 +1,4 @@
 yfinance
 alpaca-py
 pyyaml
+pytest  # tests only (python -m pytest tests/)
