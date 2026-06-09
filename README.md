@@ -32,7 +32,9 @@ turns each weekly report from a standalone essay into a continuous record:
   (e.g. `Conviction: 3/5 (↓ from 4 last week)`).
 - **Performance.** A per-thesis **Portfolio performance** block marks last week's mock
   portfolio to current prices (week-over-week return) and tracks a since-inception equity
-  curve. Options overlays and any ticker with no current price are excluded and noted.
+  curve — both shown against SPY over the same period, so "+2%" reads differently in a
+  +5% tape than a -3% one. Options overlays and any ticker with no current price are
+  excluded and noted. (Change the benchmark by editing `BENCHMARK_TICKER`.)
 - **Calibration.** A book-level **Conviction Calibration & Ledger** section summarizes
   every thesis and, once enough history accrues, reports whether higher-conviction weeks
   were actually followed by better subsequent returns.
@@ -51,7 +53,7 @@ pip install -r requirements.txt
 
 The script needs the Claude Code CLI on `PATH` (or installed in a standard Windows location — it auto-discovers).
 
-Optional but recommended for ticker enrichment, set as user environment variables:
+Optional but recommended for ticker enrichment: copy `.env.example` to `.env` and fill in your Alpaca keys (free paper / read-only keys work):
 
 ```
 ALPACA_API_KEY     # paper / read-only key
@@ -59,7 +61,7 @@ ALPACA_API_SECRET
 ALPACA_FEED        # "iex" (default, ~15min delayed, free) or "sip"
 ```
 
-Without Alpaca keys the script falls back to yfinance for everything — slower but works.
+The script loads `.env` itself, so scheduled Task Scheduler runs see the keys too (they don't inherit shell exports — plain user environment variables also work). Values exported in your shell override the file. Without Alpaca keys the script logs a notice and falls back to yfinance for everything — slower but works; transient yfinance failures are retried with backoff.
 
 ## Writing theses
 
@@ -160,6 +162,20 @@ is safe — it replaces the tasks).
 Logs land in `logs/weekend.log` and `logs/assemble.log`. Verify the tasks with
 `Get-ScheduledTask -TaskName 'ThesisResearch-*'`.
 
-## What's gitignored
+## Tests
 
-`theses.md` and `reports/` are gitignored by default — the example theses file is the only thing in the repo. Your real beliefs, generated research, and the history sidecars (`reports/*_research.json`) all stay local.
+```bash
+python -m pytest tests/ -q
+```
+
+Covers the parsing/math core (ticker extraction, portfolio-table parsing, weekly-return and benchmark-index math, `.env` loading) with no network or Claude calls.
+
+## Privacy: what's gitignored (and the tripwire)
+
+`theses*.md` (except the example), `reports/`, `logs/`, and `.env*` (except the template) are gitignored — the example theses file is the only thesis content in the repo. Your real beliefs, generated research, and the history sidecars (`reports/*_research.json`) all stay local.
+
+As a backstop against forced adds or renamed copies slipping through, `hooks/pre-commit` blocks any commit that stages those private paths. Enable it once per clone:
+
+```bash
+git config core.hooksPath hooks
+```

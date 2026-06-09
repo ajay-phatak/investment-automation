@@ -1,5 +1,7 @@
-# Personal theses — keep your real ones private. Commit theses.example.md instead.
-theses.md
+# Personal theses — keep your real ones private (any variant: theses_old.md,
+# "theses backup.md", ...). Commit theses.example.md instead.
+theses*.md
+!theses.example.md
 
 # Generated reports may contain personal opinions / position-revealing content.
 reports/
@@ -7,9 +9,10 @@ reports/
 # Local execution logs.
 logs/
 
-# Environment & secrets.
+# Environment & secrets. The empty-valued template is the one exception.
 .env
 .env.*
+!.env.example
 
 # Python
 __pycache__/

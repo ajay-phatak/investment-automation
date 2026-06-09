@@ -1,0 +1,21 @@
+#!/bin/sh
+# Privacy tripwire: this repo is PUBLIC. Real theses, generated reports, logs,
+# and secrets must never be committed — .gitignore covers the common paths, but
+# a forced add or a renamed copy (theses_old.md) would slip through. This hook
+# is the backstop. Enabled via: git config core.hooksPath hooks
+
+staged=$(git diff --cached --name-only)
+
+blocked=$(printf '%s\n' "$staged" \
+  | grep -Ei '^(reports/|logs/|\.env$|\.env\.|theses[^/]*\.md$)' \
+  | grep -Eiv '^(theses\.example\.md|\.env\.example)$')
+
+if [ -n "$blocked" ]; then
+  echo "COMMIT BLOCKED — these staged files must stay local (public repo):" >&2
+  printf '  %s\n' $blocked >&2
+  echo "Unstage them (git restore --staged <file>) and retry." >&2
+  echo "If a file is genuinely safe to publish, rename it so it doesn't match" >&2
+  echo "the private patterns in hooks/pre-commit, or adjust the hook." >&2
+  exit 1
+fi
+exit 0
