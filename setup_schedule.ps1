@@ -1,9 +1,9 @@
 # setup_schedule.ps1
 #
 # Registers the weekend-spread Thesis Research scheduled tasks in Windows
-# Task Scheduler. The weekend worker fires 8 times across Sat/Sun, each run
-# researching one pending thesis; the assembly task stitches the batch into
-# a report Monday morning.
+# Task Scheduler. The weekend worker fires every 3 hours across Sat/Sun (16
+# slots), each run researching one pending thesis. The batch auto-assembles
+# the moment the last unit finishes; the Monday task is only a fallback.
 #
 # Run once (re-running is safe — it replaces the existing tasks):
 #     powershell -ExecutionPolicy Bypass -File setup_schedule.ps1
@@ -38,17 +38,29 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Hours 1)
 
-# Weekend worker: 8 slots, ~3h apart. Surplus slots no-op or retry failures.
-# To grow the book past 8 theses, add more triggers here and re-run.
+# Weekend worker: every 3 hours, midnight-to-9PM on BOTH Saturday and Sunday
+# (16 slots). A full second day means a weekend where Saturday is entirely
+# missed (machine off) still completes on Sunday. Once 6 units finish the batch
+# auto-assembles and every later slot no-ops, so surplus slots cost nothing.
 $weekendTriggers = @(
+    # Saturday — every 3h, 00:00 → 21:00
+    New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At '12:00AM'
+    New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At '3:00AM'
     New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At '6:00AM'
     New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At '9:00AM'
     New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At '12:00PM'
     New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At '3:00PM'
     New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At '6:00PM'
     New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At '9:00PM'
+    # Sunday — every 3h, 00:00 → 21:00
+    New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday   -At '12:00AM'
+    New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday   -At '3:00AM'
+    New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday   -At '6:00AM'
     New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday   -At '9:00AM'
     New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday   -At '12:00PM'
+    New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday   -At '3:00PM'
+    New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday   -At '6:00PM'
+    New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday   -At '9:00PM'
 )
 $weekendAction = New-ScheduledTaskAction -Execute $researchBat -WorkingDirectory $scriptDir
 
@@ -67,7 +79,7 @@ foreach ($name in @($weekendTask, $assembleTask)) {
 Register-ScheduledTask -TaskName $weekendTask `
     -Description 'Thesis Research - research one pending thesis per slot, spread across the weekend.' `
     -Trigger $weekendTriggers -Action $weekendAction -Settings $settings | Out-Null
-Write-Host "Registered: $weekendTask  (8 weekend slots, Sat/Sun)"
+Write-Host "Registered: $weekendTask  (16 weekend slots, every 3h Sat/Sun)"
 
 Register-ScheduledTask -TaskName $assembleTask `
     -Description 'Thesis Research - assemble the weekend batch into the Monday report.' `

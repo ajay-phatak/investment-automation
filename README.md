@@ -138,19 +138,24 @@ powershell -ExecutionPolicy Bypass -File setup_schedule.ps1
 
 | Task | When | Runs |
 |------|------|------|
-| `ThesisResearch-Weekend` | Sat 06:00, 09:00, 12:00, 15:00, 18:00, 21:00; Sun 09:00, 12:00 | `run_research_next.bat` |
+| `ThesisResearch-Weekend` | Every 3h on Sat **and** Sun, 00:00–21:00 (16 slots) | `run_research_next.bat` |
 | `ThesisResearch-Assemble` | Mon 07:00 (fallback) | `run_assemble.bat` |
 
 The report normally assembles itself the moment the last weekend slot finishes;
 the Monday task only does work if no weekend slot completed the batch (e.g. the
 machine was asleep for the finishing slot).
 
-Eight weekend slots, ~3 hours apart — so any rolling 5-hour quota window touches
-at most ~2 theses. Each thesis now makes two Claude calls (research + portfolio;
-the portfolio pass runs with WebSearch off, so it's the cheaper of the two), so
-budget ~4 calls per window. Surplus slots no-op cleanly (or retry a failed
-thesis). **If your book ever exceeds 8 theses**, add more triggers to
-`setup_schedule.ps1` and re-run it (re-running is safe — it replaces the tasks).
+Sixteen weekend slots, 3 hours apart — a full day's worth on **each** of Saturday
+and Sunday. Any rolling 5-hour quota window touches at most ~2 theses; each thesis
+makes two Claude calls (research + portfolio; the portfolio pass runs with
+WebSearch off, so it's the cheaper of the two), so budget ~4 calls per window.
+Because the batch auto-assembles once the last unit finishes, every slot after
+that no-ops — so the dense schedule costs nothing once the report is out. The
+duplicated second day is deliberate: if the machine is off for all of Saturday,
+Sunday alone still has 8 slots, enough to research every thesis plus the new-thesis
+scan. **If your book ever exceeds ~7 theses** (8 units incl. the scan, the per-day
+slot count), add more triggers to `setup_schedule.ps1` and re-run it (re-running
+is safe — it replaces the tasks).
 
 Logs land in `logs/weekend.log` and `logs/assemble.log`. Verify the tasks with
 `Get-ScheduledTask -TaskName 'ThesisResearch-*'`.
