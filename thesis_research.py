@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -99,6 +100,12 @@ MOCK_PORTFOLIO_USD = 5000
 # each sidecar record stores its price + a running benchmark index so every
 # weekly/since-inception number can be read against the market.
 BENCHMARK_TICKER = "SPY"
+
+# Optional Obsidian delivery: when OBSIDIAN_VAULT_DIR is set (usually via .env),
+# every saved report is also written into the vault. Plain file write — Obsidian
+# indexes disk changes itself, so this works unattended with no plugins/API.
+OBSIDIAN_VAULT_DIR = os.environ.get("OBSIDIAN_VAULT_DIR")
+OBSIDIAN_REPORTS_SUBDIR = "claude reports/market research agent"
 
 
 # ── Claude Code CLI plumbing ────────────────────────────────────────────────
@@ -186,6 +193,15 @@ def parse_theses(path: Path) -> tuple[str, list[dict]]:
 
 # ── Price enrichment ────────────────────────────────────────────────────────
 
+def _alpaca_invalid_symbol(error_text: str, symbols: list[str]) -> str | None:
+    """Extract the symbol Alpaca rejected from an 'invalid symbol: X' error,
+    but only if it's actually one we asked for (guards against misparsing)."""
+    m = re.search(r"invalid symbol:?\s*([A-Za-z0-9.\-]+)", error_text, re.IGNORECASE)
+    if m and m.group(1).upper() in symbols:
+        return m.group(1).upper()
+    return None
+
+
 def _fetch_alpaca_52w(tickers: list[str]) -> dict:
     """Pull ~1Y of daily bars from Alpaca for all tickers in one batched
     request. Returns {ticker: {price, low_52w, high_52w, source}} for tickers
@@ -209,20 +225,36 @@ def _fetch_alpaca_52w(tickers: list[str]) -> dict:
     # 380 calendar days buffers around weekends/holidays to guarantee 252 trading days.
     start = end - timedelta(days=380)
     feed = DataFeed.SIP if ALPACA_FEED == "sip" else DataFeed.IEX
-    try:
-        request = StockBarsRequest(
-            symbol_or_symbols=tickers,
-            timeframe=TimeFrame.Day,
-            start=start,
-            end=end,
-            feed=feed,
-        )
-        bars = client.get_stock_bars(request)
-    except Exception as e:
-        print(f"Alpaca fetch failed: {e} — falling back to yfinance for all tickers")
+
+    # One non-US symbol (e.g. SAAB-B.ST) makes Alpaca reject the ENTIRE batched
+    # request, which would silently push every US ticker onto yfinance and invite
+    # rate limiting. Alpaca names the offender in the error — drop it and retry
+    # so the rest of the batch still gets served.
+    symbols = list(tickers)
+    bars = None
+    while symbols:
+        try:
+            request = StockBarsRequest(
+                symbol_or_symbols=symbols,
+                timeframe=TimeFrame.Day,
+                start=start,
+                end=end,
+                feed=feed,
+            )
+            bars = client.get_stock_bars(request)
+            break
+        except Exception as e:
+            bad = _alpaca_invalid_symbol(str(e), symbols)
+            if bad:
+                print(f"  Alpaca rejected {bad} — retrying batch without it")
+                symbols.remove(bad)
+                continue
+            print(f"Alpaca fetch failed: {e} — falling back to yfinance for all tickers")
+            return out
+    if bars is None:
         return out
 
-    for symbol in tickers:
+    for symbol in symbols:
         bar_list = bars.data.get(symbol, [])
         if not bar_list:
             continue
@@ -280,6 +312,9 @@ def _fetch_yfinance_52w(tickers: list[str]) -> dict:
             "high_52w": round(float(high_52w), 4),
             "source": "yfinance",
         }
+    failed = sorted(t for t, info in out.items() if "error" in info)
+    if failed:
+        print(f"  yfinance returned no usable data for: {', '.join(failed)}")
     return out
 
 
@@ -318,6 +353,8 @@ def _is_priced(info: dict | None) -> bool:
 # ── Ticker extraction & rendering ───────────────────────────────────────────
 
 YAML_BLOCK_RE = re.compile(r"```yaml\s*\n(.*?)\n```", re.DOTALL)
+TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+SCAN_THESIS_RE = re.compile(r"^###\s*Thesis:\s*(.+?)\s*$", re.MULTILINE)
 
 
 def extract_tickers_from_response(response: str) -> list[str]:
@@ -332,9 +369,30 @@ def extract_tickers_from_response(response: str) -> list[str]:
             continue
         for ticker in _walk_strings(data):
             t = ticker.strip().upper()
-            if t and re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", t):
+            if t and TICKER_RE.match(t):
                 found.append(t)
     return found
+
+
+def parse_scan_suggestions(response: str) -> list[dict]:
+    """Parse a new-thesis-scan response into [{title, tickers}], pairing each
+    '### Thesis:' heading with the tickers_to_research block in its segment."""
+    out: list[dict] = []
+    matches = list(SCAN_THESIS_RE.finditer(response))
+    for i, m in enumerate(matches):
+        seg_end = matches[i + 1].start() if i + 1 < len(matches) else len(response)
+        segment = response[m.start():seg_end]
+        tickers: list[str] = []
+        for ym in YAML_BLOCK_RE.finditer(segment):
+            try:
+                data = yaml.safe_load(ym.group(1))
+            except yaml.YAMLError:
+                continue
+            if isinstance(data, dict) and "tickers_to_research" in data:
+                tickers = [t.strip().upper() for t in _walk_strings(data)
+                           if t.strip() and TICKER_RE.match(t.strip().upper())]
+        out.append({"title": m.group(1).strip(), "tickers": tickers})
+    return out
 
 
 def _walk_strings(node):
@@ -421,7 +479,8 @@ def format_enrichment_table(enrichment: dict) -> str:
 # ── Prompt builders ─────────────────────────────────────────────────────────
 
 def build_analysis_prompt(strategy_preamble: str, thesis: dict, allow_web: bool,
-                          prior_context: str | None = None) -> str:
+                          prior_context: str | None = None,
+                          past_cats: list[dict] | None = None) -> str:
     today = datetime.now(ET).strftime("%A, %B %d, %Y")
     web_instruction = (
         "Use WebSearch and WebFetch aggressively to ground your analysis in current "
@@ -441,6 +500,24 @@ def build_analysis_prompt(strategy_preamble: str, thesis: dict, allow_web: bool,
         if prior_context else ""
     )
     direction_values = "up | down | flat (versus your prior conviction)" if prior_context else "n/a"
+
+    # When previously flagged catalysts have come due, demand a structured verdict
+    # on each so resolution accuracy can be tracked over time (not just prose).
+    outcomes_block, outcomes_rule = "", ""
+    if past_cats:
+        listed = "; ".join(f"{c['date']} {c['what']}" for c in past_cats)
+        outcomes_block = (
+            "\ncatalyst_outcomes:       # one verdict per past-due catalyst from the continuity block\n"
+            '  - {date: 2026-06-29, what: "the event as originally flagged", '
+            'outcome: for, note: "one line on what actually happened"}'
+        )
+        outcomes_rule = (
+            f"\n- `catalyst_outcomes` must contain exactly one entry per past-due catalyst "
+            f"({listed}). `outcome` is exactly one of: for | against | mixed | pending. "
+            "for/against = the event resolved in favor of / against the thesis; mixed = ambiguous; "
+            "pending = postponed or hasn't actually happened yet — re-list pending events under "
+            "`catalysts` with the new expected date."
+        )
 
     return f"""You are an investment research analyst helping a sophisticated retail investor stress-test one of their investment theses. Today is {today}.
 
@@ -491,7 +568,7 @@ conviction: 3            # integer 1 (weak / would barely hold) to 5 (high convi
 direction: {direction_values}
 conviction_note: "one short line on your conviction and what moved it"
 catalysts:
-  - {{date: 2026-08-15, what: "what happens on/around then"}}
+  - {{date: 2026-08-15, what: "what happens on/around then"}}{outcomes_block}
 ```
 
 CRITICAL FORMATTING RULES:
@@ -500,6 +577,7 @@ CRITICAL FORMATTING RULES:
 - If a side is empty (e.g. no clear downside indexes), use an empty list `[]`, do not omit the key.
 - Only the Indexes/Stocks lists and the final metadata block use yaml. Do NOT output a mock portfolio, scenario matrix, or trigger logic in this pass — those are built in a second pass once live prices are available.
 - The metadata block must have an integer `conviction` and ISO-format (YYYY-MM-DD) `catalysts` dates.
+- `catalysts` is forward-looking: upcoming events only — do not re-list catalysts that have already resolved.{outcomes_rule}
 """
 
 
@@ -545,9 +623,21 @@ CRITICAL: The Mock Portfolio and Scenario Matrix MUST be Markdown tables, never 
 """
 
 
-def build_new_thesis_prompt(strategy_preamble: str, existing_titles: list[str], allow_web: bool) -> str:
+SCAN_PROMPT_SUGGESTION_LIMIT = 12  # most recent prior suggestions fed back for dedup
+
+
+def build_new_thesis_prompt(strategy_preamble: str, existing_titles: list[str], allow_web: bool,
+                            prior_suggestions: list[dict] | None = None) -> str:
     today = datetime.now(ET).strftime("%A, %B %d, %Y")
     existing = "\n".join(f"- {t}" for t in existing_titles) or "(none)"
+    prior_block = ""
+    if prior_suggestions:
+        recent = prior_suggestions[-SCAN_PROMPT_SUGGESTION_LIMIT:]
+        listed = "\n".join(f"- {s.get('date', '?')}: {s.get('title', '')}" for s in recent)
+        prior_block = f"""
+
+IDEAS YOUR PREVIOUS SCANS ALREADY SUGGESTED (the investor reviewed these and did not adopt them — do NOT re-suggest them or close variants; bring genuinely fresh angles):
+{listed}"""
     web_instruction = (
         "Use WebSearch to scan recent news, macro data releases, central bank "
         "communications, regulatory developments, earnings reactions, and price action "
@@ -564,7 +654,7 @@ INVESTOR'S STRATEGY CONTEXT:
 {strategy_preamble or "(no strategy preamble provided)"}
 
 THESES THEY ALREADY HOLD (do NOT re-suggest variants of these):
-{existing}
+{existing}{prior_block}
 
 YOUR JOB:
 {web_instruction}
@@ -602,15 +692,20 @@ CRITICAL FORMATTING RULES:
 # ── History, performance & calibration ──────────────────────────────────────
 #
 # Each report writes a structured sidecar (reports/{date}_research.json) capturing,
-# per thesis: conviction (1-5) + direction, catalysts, the mock-portfolio holdings
-# with entry prices, the realized weekly return of the PRIOR week's holdings, a
-# running time-weighted equity index (100 at inception), and a period-paired
-# benchmark (BENCHMARK_TICKER) price + index so performance reads against the
-# market. This single store powers both week-over-week continuity (#3) and the
-# backtest ledger / calibration (#5).
+# per thesis: conviction (1-5) + direction, catalysts (plus structured verdicts on
+# catalysts that came due), the mock-portfolio holdings with entry prices, the
+# realized weekly return of the PRIOR week's holdings, a running time-weighted
+# equity index (100 at inception), and a period-paired benchmark (BENCHMARK_TICKER)
+# price + index so performance reads against the market. This single store powers
+# week-over-week continuity (#3), the backtest ledger / calibration (#5), and the
+# catalyst calendar / resolution tracking.
 # Theses are matched across weeks by a normalized title key.
 
 CALIBRATION_MIN_PAIRS = 8  # need this many conviction→next-week-return pairs before reporting calibration
+
+# Structured verdicts on past-due catalysts (see build_analysis_prompt). Anything
+# else the model emits is coerced to "unscored" rather than polluting the stats.
+CATALYST_OUTCOMES = {"for", "against", "mixed", "pending"}
 
 
 def thesis_key(title: str) -> str:
@@ -653,12 +748,34 @@ def normalize_meta(meta: dict | None) -> dict:
     for c in (meta.get("catalysts") or []):
         if isinstance(c, dict):
             cats.append({"date": str(c.get("date", "")), "what": str(c.get("what", ""))})
+    outcomes = []
+    for c in (meta.get("catalyst_outcomes") or []):
+        if isinstance(c, dict):
+            verdict = str(c.get("outcome", "")).strip().lower()
+            outcomes.append({
+                "date": str(c.get("date", "")),
+                "what": str(c.get("what", "")),
+                "outcome": verdict if verdict in CATALYST_OUTCOMES else "unscored",
+                "note": str(c.get("note", "") or ""),
+            })
     return {
         "conviction": conv,
         "direction": str(meta.get("direction", "n/a")).lower(),
         "conviction_note": str(meta.get("conviction_note", "") or ""),
         "catalysts": cats,
+        "catalyst_outcomes": outcomes,
     }
+
+
+def past_catalysts(rec: dict, today: str) -> list[dict]:
+    """Prior-flagged catalysts whose date has come due (date <= today) — the ones
+    the next analysis pass must deliver a structured verdict on."""
+    out = []
+    for c in (rec.get("catalysts") or []):
+        d = str(c.get("date", ""))
+        if d and d <= today:
+            out.append({"date": d, "what": str(c.get("what", ""))})
+    return out
 
 
 def parse_portfolio_table(portfolio_md: str) -> list[dict]:
@@ -715,6 +832,41 @@ def load_prior_state(key: str, before_date: str) -> tuple[str, dict] | None:
     return None
 
 
+def load_scan_suggestions(before_date: str) -> list[dict]:
+    """Every past new-thesis-scan suggestion from sidecars dated < before_date,
+    oldest first, deduped by normalized title (the original suggestion wins so
+    its track record starts from the first time the idea surfaced)."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for p in sorted(REPORTS_DIR.glob("*_research.json")):
+        d = p.name[:10]
+        if not (len(d) == 10 and d < before_date):
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        for s in data.get("scan_suggestions", []):
+            key = s.get("key") or thesis_key(s.get("title", ""))
+            if key and key not in seen:
+                seen.add(key)
+                out.append({**s, "key": key, "date": s.get("date") or d})
+    return out
+
+
+def build_suggestion_records(suggestions: list[dict], enrichment: dict, report_date: str) -> list[dict]:
+    """Sidecar records for this run's scan suggestions, snapshotting the price of
+    every priceable suggested ticker so future runs can mark the basket."""
+    records = []
+    for s in suggestions:
+        prices = {t: enrichment[t]["price"] for t in s.get("tickers", [])
+                  if _is_priced(enrichment.get(t))}
+        records.append({"key": thesis_key(s["title"]), "title": s["title"],
+                        "date": report_date, "tickers": s.get("tickers", []),
+                        "prices": prices})
+    return records
+
+
 def compute_weekly_return(prior_holdings: list[dict], enrichment: dict) -> tuple[list[dict], float | None]:
     """Mark prior holdings to current prices. Returns (legs, weekly_return).
     Excludes option legs and legs with no current/entry price; renormalizes weights
@@ -755,6 +907,56 @@ def build_prior_context(prior_date: str, rec: dict, today: str) -> str:
         lines.append("- Prior mock-portfolio holdings (entry prices): " + ", ".join(held))
     lines.append("Use WebSearch to determine what actually changed since then.")
     return "\n".join(lines)
+
+
+def _md_cell(text: str) -> str:
+    """Make free text safe for a markdown table cell (pipes would split it)."""
+    return str(text).replace("|", "/").replace("\n", " ").strip()
+
+
+def render_catalyst_calendar(records: list[dict], report_date: str) -> str | None:
+    """Aggregate every thesis's upcoming catalysts into one forward-looking
+    timeline, nearest first. Returns None when there's nothing to show."""
+    try:
+        anchor = date.fromisoformat(report_date)
+    except ValueError:
+        return None
+    rows = []
+    for rec in records:
+        for c in (rec.get("catalysts") or []):
+            try:
+                d = date.fromisoformat(str(c.get("date", "")))
+            except ValueError:
+                continue  # unparseable date — already visible in the thesis section
+            if d >= anchor:
+                rows.append((d, rec.get("title", ""), str(c.get("what", ""))))
+    if not rows:
+        return None
+    rows.sort(key=lambda r: (r[0], r[1]))
+    lines = ["## Catalyst Calendar", "",
+             "_Every upcoming catalyst across the book, nearest first._", "",
+             "| Date | In | Thesis | Catalyst |",
+             "|------|-----|--------|----------|"]
+    for d, title, what in rows:
+        days = (d - anchor).days
+        when = "today" if days == 0 else f"{days}d"
+        lines.append(f"| {d.isoformat()} | {when} | {_md_cell(title)} | {_md_cell(what)} |")
+    return "\n".join(lines)
+
+
+OUTCOME_MARKS = {"for": "✓", "against": "✗", "mixed": "~", "pending": "⏳", "unscored": "?"}
+
+
+def render_outcome_scorecard(outcomes: list[dict]) -> str:
+    """Compact one-liner of this week's catalyst verdicts for a thesis section."""
+    parts = []
+    for o in outcomes:
+        mark = OUTCOME_MARKS.get(o["outcome"], "?")
+        part = f"{mark} {o['what']} ({o['date']}) — **{o['outcome']}**"
+        if o["note"]:
+            part += f": _{o['note']}_"
+        parts.append(part)
+    return "**Catalyst verdicts:** " + " · ".join(parts)
 
 
 def render_conviction_line(meta: dict, prior_conv: int | None) -> str:
@@ -836,14 +1038,17 @@ def compute_and_render(results: list[dict], enrichment: dict, report_date: str) 
         perf = render_performance_block(prior_date, legs, weekly, equity_index, inception_date,
                                         bench_weekly, bench_index)
         conv_line = render_conviction_line(meta, prior_conv)
+        verdicts = (render_outcome_scorecard(meta["catalyst_outcomes"]) + "\n\n"
+                    if meta["catalyst_outcomes"] else "")
         sections.append(
-            f"## Thesis: {title}\n\n{conv_line}\n\n"
+            f"## Thesis: {title}\n\n{conv_line}\n\n{verdicts}"
             f"{r['rendered_analysis']}\n\n{r['portfolio_text']}\n\n{perf}"
         )
         records.append({
             "key": key, "title": title, "inception_date": inception_date,
             "conviction": meta["conviction"], "direction": meta["direction"],
             "conviction_note": meta["conviction_note"], "catalysts": meta["catalysts"],
+            "catalyst_outcomes": meta["catalyst_outcomes"],
             "holdings": r["holdings"], "weekly_return": weekly,
             "equity_index": round(equity_index, 4), "prior_report_date": prior_date,
             "benchmark_ticker": BENCHMARK_TICKER,
@@ -853,10 +1058,13 @@ def compute_and_render(results: list[dict], enrichment: dict, report_date: str) 
     return sections, records
 
 
-def render_calibration_section(current_records: list[dict], report_date: str) -> str:
+def render_calibration_section(current_records: list[dict], report_date: str,
+                               scan_suggestions: list[dict] | None = None,
+                               enrichment: dict | None = None) -> str:
     """Book-level ledger + conviction calibration, reading all past sidecars plus
     this run's in-memory records. Calibration pairs conviction[T] with the realized
-    weekly_return[T+1] of the same thesis."""
+    weekly_return[T+1] of the same thesis. When scan_suggestions is given (past
+    suggestions + current prices in enrichment), appends the scanner's track record."""
     timeline: dict[str, list[tuple[str, dict]]] = {}
 
     def _add(d, recs):
@@ -898,6 +1106,16 @@ def render_calibration_section(current_records: list[dict], report_date: str) ->
                 buckets[c].append(ret)
                 pairs += 1
 
+    # Catalyst resolutions across all history. A verdict can be re-reported in a
+    # later week (the model re-assessing); dedup on (thesis, event date, slugged
+    # event text) keeps the latest verdict since reports are walked in date order.
+    resolutions: dict[tuple, dict] = {}
+    for k, items in timeline.items():
+        for d, rec in items:
+            for o in (rec.get("catalyst_outcomes") or []):
+                dedup = (k, o.get("date", ""), thesis_key(o.get("what", ""))[:40])
+                resolutions[dedup] = {"thesis": rec.get("title", k), "reported": d, **o}
+
     out = ["## Conviction Calibration & Ledger", "",
            "_Educational backtest of the hypothetical mock portfolios — not financial advice._", "",
            "### Ledger (latest per thesis)", "",
@@ -918,15 +1136,80 @@ def render_calibration_section(current_records: list[dict], report_date: str) ->
             if vals:
                 out.append(f"| {c}/5 | {sum(vals) / len(vals) * 100:+.1f}% | {len(vals)} |")
         out.append(f"\n_Based on {pairs} conviction→return pairs across {len(timeline)} theses._")
+
+    out += ["", "### Catalyst resolutions", ""]
+    if not resolutions:
+        out.append("_No flagged catalysts have come due yet — verdicts accrue as catalyst dates pass._")
+    else:
+        res = sorted(resolutions.values(), key=lambda r: r.get("date", ""), reverse=True)
+        counts = Counter(r["outcome"] for r in res)
+        decided = counts["for"] + counts["against"] + counts["mixed"]
+        rate = (f" — **{counts['for'] / decided * 100:.0f}%** broke the thesis's way"
+                if decided else "")
+        out += [f"{len(res)} verdict(s): {counts['for']} for · {counts['against']} against · "
+                f"{counts['mixed']} mixed · {counts['pending']} pending{rate}", "",
+                "| Event date | Thesis | Catalyst | Outcome | What happened |",
+                "|-----------|--------|----------|---------|---------------|"]
+        for r in res[:12]:
+            out.append(f"| {r.get('date', '—')} | {_md_cell(r['thesis'])} | {_md_cell(r['what'])} | "
+                       f"{r['outcome']} | {_md_cell(r['note']) or '—'} |")
+        if len(res) > 12:
+            out.append(f"\n_…and {len(res) - 12} earlier verdicts._")
+
+    if scan_suggestions is not None:
+        out += ["", "### New-thesis scan track record", ""]
+        if not scan_suggestions:
+            out.append("_No prior scan suggestions tracked yet — each weekly scan's ideas "
+                       "are recorded and marked to market from here on._")
+        else:
+            out += ["_Equal-weight basket of each past suggestion's tickers, marked from "
+                    "the suggestion date to now — a track record for the scanner, not advice._", "",
+                    "| Suggested | Idea | Basket since | Priced |",
+                    "|-----------|------|--------------|--------|"]
+            newest_first = sorted(scan_suggestions, key=lambda s: s.get("date", ""), reverse=True)
+            for s in newest_first[:15]:
+                rets = []
+                for t, p0 in (s.get("prices") or {}).items():
+                    info = (enrichment or {}).get(t)
+                    if _is_priced(info) and p0:
+                        rets.append(info["price"] / p0 - 1.0)
+                basket = f"{sum(rets) / len(rets) * 100:+.1f}%" if rets else "—"
+                out.append(f"| {s.get('date', '—')} | {_md_cell(s.get('title', ''))} | {basket} | "
+                           f"{len(rets)}/{len(s.get('tickers') or [])} |")
+            if len(newest_first) > 15:
+                out.append(f"\n_…and {len(newest_first) - 15} earlier suggestions._")
     return "\n".join(out)
 
 
-def write_sidecar(report_date: str, records: list[dict]) -> None:
+def write_sidecar(report_date: str, records: list[dict],
+                  scan_suggestions: list[dict] | None = None) -> None:
     """Persist the structured per-thesis history sidecar next to the report."""
     payload = {"report_date": report_date,
                "generated_at": datetime.now(ET).isoformat(),
-               "theses": records}
+               "theses": records,
+               "scan_suggestions": scan_suggestions or []}
     _write_json_atomic(REPORTS_DIR / f"{report_date}_research.json", payload)
+
+
+def deliver_to_obsidian(report_date: str, report_text: str) -> None:
+    """Mirror a saved report into the Obsidian vault with minimal frontmatter.
+    Best-effort: delivery problems are logged but never fail the run — the
+    canonical copy in reports/ is already on disk by the time this runs."""
+    if not OBSIDIAN_VAULT_DIR:
+        return
+    try:
+        vault = Path(OBSIDIAN_VAULT_DIR)
+        if not vault.exists():
+            print(f"[{_ts()}] Obsidian vault not found at {vault} — skipping delivery.")
+            return
+        dest_dir = vault / OBSIDIAN_REPORTS_SUBDIR
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        frontmatter = f"---\ndate: {report_date}\ntags: [market-research]\n---\n\n"
+        dest = dest_dir / f"{report_date}_research.md"
+        dest.write_text(frontmatter + report_text, encoding="utf-8")
+        print(f"[{_ts()}] Report delivered to Obsidian → {dest}")
+    except OSError as e:
+        print(f"[{_ts()}] Obsidian delivery failed (report still saved locally): {e}")
 
 
 # ── Main flow ───────────────────────────────────────────────────────────────
@@ -984,10 +1267,13 @@ def run(args: argparse.Namespace) -> str:
         print(f"[{_ts()}] [{i}/{len(theses)}] Researching: {thesis['title']!r}")
         prior = load_prior_state(key, report_date)
         prior_context = build_prior_context(prior[0], prior[1], report_date) if prior else None
+        past_cats = past_catalysts(prior[1], report_date) if prior else []
         if prior_context:
-            print(f"[{_ts()}]   Continuity: threading in prior take from {prior[0]}.")
+            print(f"[{_ts()}]   Continuity: threading in prior take from {prior[0]}"
+                  + (f" ({len(past_cats)} catalyst(s) due a verdict)." if past_cats else "."))
         analysis_raw = call_claude(
-            build_analysis_prompt(preamble, thesis, allow_web, prior_context), allow_web=allow_web)
+            build_analysis_prompt(preamble, thesis, allow_web, prior_context, past_cats),
+            allow_web=allow_web)
         meta, analysis = split_meta_block(analysis_raw)
         tickers = extract_tickers_from_response(analysis)
         prior_tickers = [h["ticker"] for h in (prior[1].get("holdings") if prior else [])
@@ -1007,15 +1293,31 @@ def run(args: argparse.Namespace) -> str:
         combined_enrichment.update(enrich_tickers([BENCHMARK_TICKER]))
 
     sections, records = compute_and_render(results, combined_enrichment, report_date)
+    calendar = render_catalyst_calendar(records, report_date)
+    if calendar:
+        sections.insert(0, calendar)
 
+    prior_suggestions = load_scan_suggestions(report_date)
+
+    scan_records: list[dict] = []
     if not args.skip_new_thesis_scan and not args.thesis:
         print(f"[{_ts()}] Running new-thesis scan...")
-        prompt = build_new_thesis_prompt(preamble, [t["title"] for t in theses], allow_web)
+        prompt = build_new_thesis_prompt(preamble, [t["title"] for t in theses], allow_web,
+                                         prior_suggestions)
         response = call_claude(prompt, allow_web=allow_web)
-        enrichment = enrich_tickers(extract_tickers_from_response(response))
-        sections.append(replace_yaml_blocks_with_tables(response, enrichment))
+        scan_enrichment = enrich_tickers(extract_tickers_from_response(response))
+        sections.append(replace_yaml_blocks_with_tables(response, scan_enrichment))
+        scan_records = build_suggestion_records(parse_scan_suggestions(response),
+                                                scan_enrichment, report_date)
 
-    sections.append(render_calibration_section(records, report_date))
+    # Mark past scan suggestions to current prices for the track record.
+    sugg_missing = sorted({t for s in prior_suggestions for t in (s.get("tickers") or [])
+                           if not _is_priced(combined_enrichment.get(t))})
+    if sugg_missing:
+        combined_enrichment.update(enrich_tickers(sugg_missing))
+
+    sections.append(render_calibration_section(records, report_date,
+                                               prior_suggestions, combined_enrichment))
 
     header = (f"# Market Research — {report_date}\n\n"
               f"_Generated {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} from {theses_path.name}_\n")
@@ -1030,8 +1332,9 @@ def run(args: argparse.Namespace) -> str:
         if args.thesis:
             print(f"[{_ts()}] Report saved → {out} (filtered run — history sidecar not written).")
         else:
-            write_sidecar(report_date, records)
+            write_sidecar(report_date, records, scan_records)
             print(f"[{_ts()}] Report saved → {out} (+ history sidecar).")
+        deliver_to_obsidian(report_date, report)
 
     return report
 
@@ -1189,8 +1492,10 @@ def run_research_next(args: argparse.Namespace) -> None:
             thesis = {"title": unit["title"], "body": unit["body"]}
             prior = load_prior_state(thesis_key(unit["title"]), report_date)
             prior_context = build_prior_context(prior[0], prior[1], report_date) if prior else None
+            past_cats = past_catalysts(prior[1], report_date) if prior else []
             analysis_raw = call_claude(
-                build_analysis_prompt(preamble, thesis, allow_web, prior_context), allow_web=allow_web)
+                build_analysis_prompt(preamble, thesis, allow_web, prior_context, past_cats),
+                allow_web=allow_web)
             _, analysis = split_meta_block(analysis_raw)
             tickers = extract_tickers_from_response(analysis)
             prior_tickers = [h["ticker"] for h in (prior[1].get("holdings") if prior else [])
@@ -1202,7 +1507,9 @@ def run_research_next(args: argparse.Namespace) -> None:
         else:
             existing = [u["title"] for u in manifest["units"] if u["kind"] == "thesis"]
             unit["raw_response"] = call_claude(
-                build_new_thesis_prompt(preamble, existing, allow_web), allow_web=allow_web)
+                build_new_thesis_prompt(preamble, existing, allow_web,
+                                        load_scan_suggestions(report_date)),
+                allow_web=allow_web)
     except Exception as e:
         unit["last_error"] = str(e)[:1000]
         save_manifest(mpath, manifest)
@@ -1267,6 +1574,8 @@ def run_assemble(args: argparse.Namespace) -> None:
         else:
             all_tickers += extract_tickers_from_response(u.get("raw_response") or "")
     all_tickers.append(BENCHMARK_TICKER)  # benchmark shares the same price snapshot
+    prior_suggestions = load_scan_suggestions(report_date)
+    all_tickers += [t for s in prior_suggestions for t in (s.get("tickers") or [])]
     enrichment = enrich_tickers(all_tickers)
 
     # Pass B — normalize done thesis units (unit order) and render their sections.
@@ -1288,12 +1597,16 @@ def run_assemble(args: argparse.Namespace) -> None:
 
     # Pass C — stitch in unit order, weaving placeholders + scan back in.
     sections: list[str] = []
+    scan_records: list[dict] = []
     for u in units:
         if u["status"] == "done":
             if u["kind"] == "thesis":
                 sections.append(sec_by_id[u["id"]])
             else:
-                sections.append(replace_yaml_blocks_with_tables(u.get("raw_response") or "", enrichment))
+                raw = u.get("raw_response") or ""
+                sections.append(replace_yaml_blocks_with_tables(raw, enrichment))
+                scan_records = build_suggestion_records(parse_scan_suggestions(raw),
+                                                        enrichment, report_date)
         else:
             err = f" Last error: {u['last_error']}" if u.get("last_error") else ""
             placeholder = f"> ⚠ Not researched this batch — {u['attempts']} attempt(s).{err}"
@@ -1302,7 +1615,12 @@ def run_assemble(args: argparse.Namespace) -> None:
             else:
                 sections.append(f"## Suggested new theses\n\n{placeholder}")
 
-    sections.append(render_calibration_section(records, report_date))
+    calendar = render_catalyst_calendar(records, report_date)
+    if calendar:
+        sections.insert(0, calendar)
+
+    sections.append(render_calibration_section(records, report_date,
+                                               prior_suggestions, enrichment))
 
     header = (f"# Market Research — {report_date}\n\n"
               f"_Weekend batch assembled {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} "
@@ -1320,8 +1638,9 @@ def run_assemble(args: argparse.Namespace) -> None:
     REPORTS_DIR.mkdir(exist_ok=True)
     out = REPORTS_DIR / f"{report_date}_research.md"
     out.write_text(report, encoding="utf-8")
-    write_sidecar(report_date, records)
+    write_sidecar(report_date, records, scan_records)
     print(f"[{_ts()}] Report saved → {out} (+ history sidecar).")
+    deliver_to_obsidian(report_date, report)
 
     # Archive the manifest so next weekend starts a fresh batch.
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)

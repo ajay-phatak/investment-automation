@@ -38,6 +38,18 @@ turns each weekly report from a standalone essay into a continuous record:
 - **Calibration.** A book-level **Conviction Calibration & Ledger** section summarizes
   every thesis and, once enough history accrues, reports whether higher-conviction weeks
   were actually followed by better subsequent returns.
+- **Catalyst calendar.** Each report opens with a forward-looking timeline aggregating
+  every thesis's flagged catalysts — what fires next, when, and for which thesis.
+- **Catalyst resolutions.** When a flagged catalyst's date passes, the next analysis pass
+  must return a structured verdict (`for | against | mixed | pending`) on what actually
+  happened. Verdicts surface as a per-thesis scorecard line and accrue into a book-level
+  hit-rate ("how often do the catalysts I flag break my way") — an event-level
+  calibration that's far less noisy than weekly price returns.
+- **Scan accountability.** Every idea the weekly new-thesis scan proposes is recorded in
+  the sidecar with its suggested tickers priced at suggestion time. Past suggestions are
+  fed back into the scan prompt (so it stops re-pitching ideas you passed on), and each
+  suggestion's equal-weight ticker basket is marked to market weekly in a **scan track
+  record** table — over time you learn how seriously to take the scanner.
 
 Theses are matched across weeks by their normalized title, so **substantially renaming a
 thesis resets its history** (it's treated as new). This adds no extra Claude calls — the
@@ -62,6 +74,10 @@ ALPACA_FEED        # "iex" (default, ~15min delayed, free) or "sip"
 ```
 
 The script loads `.env` itself, so scheduled Task Scheduler runs see the keys too (they don't inherit shell exports — plain user environment variables also work). Values exported in your shell override the file. Without Alpaca keys the script logs a notice and falls back to yfinance for everything — slower but works; transient yfinance failures are retried with backoff.
+
+### Obsidian delivery (optional)
+
+Set `OBSIDIAN_VAULT_DIR` in `.env` to your vault's absolute path and every saved report is also written to `<vault>/claude reports/market research agent/{date}_research.md` with minimal frontmatter (`date`, `tags: [market-research]`). It's a plain file write — Obsidian indexes disk changes itself, so it works unattended with no plugins or API. Delivery is best-effort: a missing vault (e.g. OneDrive offline) logs a warning and never fails the run; `reports/` remains the canonical copy.
 
 ## Writing theses
 
