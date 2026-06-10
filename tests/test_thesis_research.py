@@ -187,6 +187,17 @@ def test_parse_portfolio_table_empty_input():
     assert tr.parse_portfolio_table("") == []
 
 
+# ── Alpaca batch-poisoning guard ────────────────────────────────────────────
+
+def test_alpaca_invalid_symbol_extraction():
+    symbols = ["LNG", "SAAB-B.ST", "TLT"]
+    err = '{"message":"invalid symbol: SAAB-B.ST"}'
+    assert tr._alpaca_invalid_symbol(err, symbols) == "SAAB-B.ST"
+    # symbol not in our request -> no match (don't misparse unrelated errors)
+    assert tr._alpaca_invalid_symbol('invalid symbol: OTHER', symbols) is None
+    assert tr._alpaca_invalid_symbol("rate limit exceeded", symbols) is None
+
+
 # ── _is_priced / position_pct ───────────────────────────────────────────────
 
 def test_is_priced():
@@ -284,7 +295,8 @@ def test_upcoming_monday():
 
 # ── benchmark math through compute_and_render ───────────────────────────────
 
-META = {"conviction": 3, "direction": "up", "conviction_note": "", "catalysts": []}
+META = {"conviction": 3, "direction": "up", "conviction_note": "", "catalysts": [],
+        "catalyst_outcomes": []}
 
 
 def _result(key="test-thesis", title="Test Thesis"):
@@ -369,6 +381,248 @@ def test_missing_benchmark_price_still_renders(tmp_path, monkeypatch):
     assert rec["benchmark_index"] == 100.0   # not advanced without a pairable return
     assert rec["benchmark_price"] is None
     assert "vs" not in sections[0].split("Thesis weekly return")[1].split("·")[0]
+
+
+# ── catalysts: past-due detection, verdict parsing, calendar ────────────────
+
+def test_past_catalysts_filters_by_date():
+    rec = {"catalysts": [
+        {"date": "2026-06-01", "what": "already happened"},
+        {"date": "2026-06-15", "what": "today counts as due"},
+        {"date": "2026-07-01", "what": "still upcoming"},
+        {"date": "", "what": "undated"},
+    ]}
+    due = tr.past_catalysts(rec, "2026-06-15")
+    assert [c["what"] for c in due] == ["already happened", "today counts as due"]
+    assert tr.past_catalysts({}, "2026-06-15") == []
+
+
+def test_normalize_meta_parses_catalyst_outcomes():
+    out = tr.normalize_meta({
+        "conviction": 3,
+        "catalyst_outcomes": [
+            {"date": "2026-06-29", "what": "DEA hearing", "outcome": "FOR", "note": "confirmed"},
+            {"date": "2026-06-15", "what": "Sherritt update", "outcome": "thesis-confirmed!"},
+            "not-a-dict",
+        ],
+    })
+    assert out["catalyst_outcomes"][0]["outcome"] == "for"
+    assert out["catalyst_outcomes"][1]["outcome"] == "unscored"  # unknown verdict coerced
+    assert len(out["catalyst_outcomes"]) == 2
+
+
+def test_analysis_prompt_demands_verdicts_only_when_catalysts_due():
+    thesis = {"title": "T", "body": "B"}
+    with_due = tr.build_analysis_prompt(
+        "", thesis, allow_web=False, prior_context="CONTINUITY — prior take",
+        past_cats=[{"date": "2026-06-01", "what": "an event"}])
+    without = tr.build_analysis_prompt("", thesis, allow_web=False,
+                                       prior_context="CONTINUITY — prior take")
+    assert "catalyst_outcomes" in with_due
+    assert "2026-06-01 an event" in with_due
+    assert "catalyst_outcomes" not in without
+
+
+def test_render_catalyst_calendar_orders_and_filters():
+    records = [
+        {"title": "Thesis B", "catalysts": [
+            {"date": "2026-07-01", "what": "later | with pipe"},
+            {"date": "2026-06-01", "what": "already past — excluded"},
+            {"date": "garbage", "what": "bad date — skipped"},
+        ]},
+        {"title": "Thesis A", "catalysts": [
+            {"date": "2026-06-15", "what": "fires today"},
+        ]},
+    ]
+    cal = tr.render_catalyst_calendar(records, "2026-06-15")
+    assert cal.startswith("## Catalyst Calendar")
+    lines = [l for l in cal.splitlines() if l.startswith("| 2026")]
+    assert len(lines) == 2
+    assert "fires today" in lines[0] and "| today |" in lines[0]
+    assert "later / with pipe" in lines[1] and "| 16d |" in lines[1]
+    assert "excluded" not in cal and "skipped" not in cal
+
+
+def test_render_catalyst_calendar_empty_returns_none():
+    assert tr.render_catalyst_calendar([], "2026-06-15") is None
+    assert tr.render_catalyst_calendar(
+        [{"title": "T", "catalysts": [{"date": "2026-01-01", "what": "all past"}]}],
+        "2026-06-15") is None
+
+
+def test_render_outcome_scorecard():
+    line = tr.render_outcome_scorecard([
+        {"date": "2026-06-29", "what": "DEA hearing", "outcome": "for", "note": "confirmed"},
+        {"date": "2026-06-15", "what": "Sherritt", "outcome": "pending", "note": ""},
+    ])
+    assert line.startswith("**Catalyst verdicts:**")
+    assert "✓ DEA hearing (2026-06-29) — **for**: _confirmed_" in line
+    assert "⏳ Sherritt (2026-06-15) — **pending**" in line
+
+
+def test_compute_and_render_carries_outcomes_into_record_and_section(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    result = _result()
+    result["meta"]["catalyst_outcomes"] = [
+        {"date": "2026-06-10", "what": "an event", "outcome": "against", "note": "it missed"}]
+    result["meta"]["catalysts"] = []
+    enrichment = {tr.BENCHMARK_TICKER: {"price": 500.0, "low_52w": 400, "high_52w": 520}}
+    sections, records = tr.compute_and_render([result], enrichment, "2026-06-15")
+    assert records[0]["catalyst_outcomes"][0]["outcome"] == "against"
+    assert "**Catalyst verdicts:**" in sections[0]
+    assert "✗ an event" in sections[0]
+
+
+def test_resolutions_dedup_keeps_latest_and_counts(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    # Week 1 calls the verdict "pending"; week 2 re-reports the same event as "for".
+    _write_sidecar(tmp_path, "2026-06-15", {
+        "key": "test-thesis", "title": "Test Thesis", "conviction": 3,
+        "catalyst_outcomes": [
+            {"date": "2026-06-10", "what": "DEA hearing", "outcome": "pending", "note": ""}],
+    })
+    current = [{
+        "key": "test-thesis", "title": "Test Thesis", "conviction": 3,
+        "equity_index": 100.0,
+        "catalyst_outcomes": [
+            {"date": "2026-06-10", "what": "DEA hearing", "outcome": "for", "note": "confirmed"},
+            {"date": "2026-06-12", "what": "earnings", "outcome": "against", "note": "missed"},
+        ],
+    }]
+    out = tr.render_calibration_section(current, "2026-06-22")
+    assert "2 verdict(s): 1 for · 1 against · 0 mixed · 0 pending" in out
+    assert "**50%** broke the thesis's way" in out
+    # The deduped row shows the latest verdict, not the stale "pending".
+    assert out.count("DEA hearing") == 1
+
+
+def test_resolutions_empty_message(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    out = tr.render_calibration_section([], "2026-06-15")
+    assert "No flagged catalysts have come due yet" in out
+
+
+# ── new-thesis scan suggestion ledger ───────────────────────────────────────
+
+SCAN_RESPONSE = """## Suggested new theses
+
+### Thesis: Uranium supply deficit is underpriced
+
+**Rationale:** Some reasons.
+
+**Why now:** A development.
+
+**Suggested tickers to research further:**
+
+```yaml
+tickers_to_research: [CCJ, URA, lowercase_junk_that_is_too_long]
+```
+
+### Thesis: Second idea with no valid block
+
+**Rationale:** More reasons.
+"""
+
+
+def test_parse_scan_suggestions_pairs_titles_with_tickers():
+    suggestions = tr.parse_scan_suggestions(SCAN_RESPONSE)
+    assert len(suggestions) == 2
+    assert suggestions[0]["title"] == "Uranium supply deficit is underpriced"
+    assert suggestions[0]["tickers"] == ["CCJ", "URA"]
+    assert suggestions[1]["tickers"] == []
+    assert tr.parse_scan_suggestions("no suggestions here") == []
+
+
+def test_build_suggestion_records_snapshots_only_priced():
+    enrichment = {"CCJ": {"price": 55.0, "low_52w": 35, "high_52w": 62},
+                  "URA": {"error": "no data"}}
+    recs = tr.build_suggestion_records(
+        [{"title": "Uranium supply deficit", "tickers": ["CCJ", "URA"]}],
+        enrichment, "2026-06-15")
+    assert recs[0]["key"] == "uranium-supply-deficit"
+    assert recs[0]["prices"] == {"CCJ": 55.0}
+    assert recs[0]["tickers"] == ["CCJ", "URA"]
+
+
+def test_load_scan_suggestions_dedups_and_orders(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    (tmp_path / "2026-06-08_research.json").write_text(json.dumps({
+        "theses": [], "scan_suggestions": [
+            {"key": "idea-a", "title": "Idea A", "date": "2026-06-08",
+             "tickers": ["AAA"], "prices": {"AAA": 100.0}}]}), encoding="utf-8")
+    (tmp_path / "2026-06-15_research.json").write_text(json.dumps({
+        "theses": [], "scan_suggestions": [
+            {"key": "idea-a", "title": "Idea A", "date": "2026-06-15",
+             "tickers": ["AAA"], "prices": {"AAA": 120.0}},   # re-suggested — ignored
+            {"key": "idea-b", "title": "Idea B", "date": "2026-06-15",
+             "tickers": ["BBB"], "prices": {"BBB": 50.0}}]}), encoding="utf-8")
+
+    suggestions = tr.load_scan_suggestions("2026-06-22")
+    assert [s["key"] for s in suggestions] == ["idea-a", "idea-b"]
+    assert suggestions[0]["prices"]["AAA"] == 100.0  # original snapshot kept
+    # before_date excludes same-day and later sidecars
+    assert [s["key"] for s in tr.load_scan_suggestions("2026-06-15")] == ["idea-a"]
+
+
+def test_scan_prompt_feeds_back_prior_suggestions():
+    prior = [{"date": "2026-06-08", "title": "Idea A"}]
+    with_prior = tr.build_new_thesis_prompt("", ["Held thesis"], allow_web=False,
+                                            prior_suggestions=prior)
+    without = tr.build_new_thesis_prompt("", ["Held thesis"], allow_web=False)
+    assert "2026-06-08: Idea A" in with_prior
+    assert "PREVIOUS SCANS" in with_prior
+    assert "PREVIOUS SCANS" not in without
+
+
+def test_track_record_basket_math(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    suggestions = [
+        {"key": "idea-a", "title": "Idea A", "date": "2026-06-08",
+         "tickers": ["AAA", "BBB", "CCC"],
+         "prices": {"AAA": 100.0, "BBB": 200.0}},  # CCC never priced
+        {"key": "idea-b", "title": "Idea B", "date": "2026-06-01",
+         "tickers": ["DDD"], "prices": {}},
+    ]
+    enrichment = {"AAA": {"price": 110.0, "low_52w": 90, "high_52w": 120},
+                  "BBB": {"price": 210.0, "low_52w": 150, "high_52w": 250}}
+    out = tr.render_calibration_section([], "2026-06-15", suggestions, enrichment)
+    assert "### New-thesis scan track record" in out
+    # (+10% + +5%) / 2 = +7.5%, over 2 of 3 suggested tickers
+    assert "| 2026-06-08 | Idea A | +7.5% | 2/3 |" in out
+    assert "| 2026-06-01 | Idea B | — | 0/1 |" in out
+    # newest suggestion listed first
+    assert out.index("Idea A") < out.index("Idea B")
+
+
+def test_track_record_empty_and_omitted(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    with_empty = tr.render_calibration_section([], "2026-06-15", [], {})
+    assert "No prior scan suggestions tracked yet" in with_empty
+    without = tr.render_calibration_section([], "2026-06-15")
+    assert "scan track record" not in without
+
+
+# ── Obsidian delivery ───────────────────────────────────────────────────────
+
+def test_deliver_to_obsidian_writes_with_frontmatter(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "OBSIDIAN_VAULT_DIR", str(tmp_path))
+    tr.deliver_to_obsidian("2026-06-15", "# Market Research — 2026-06-15\n\nbody")
+    dest = tmp_path / tr.OBSIDIAN_REPORTS_SUBDIR / "2026-06-15_research.md"
+    assert dest.exists()
+    text = dest.read_text(encoding="utf-8")
+    assert text.startswith("---\ndate: 2026-06-15\ntags: [market-research]\n---\n")
+    assert "# Market Research — 2026-06-15" in text
+
+
+def test_deliver_to_obsidian_disabled_or_missing_vault(tmp_path, monkeypatch):
+    # Unset -> silent no-op
+    monkeypatch.setattr(tr, "OBSIDIAN_VAULT_DIR", None)
+    tr.deliver_to_obsidian("2026-06-15", "body")  # must not raise
+    # Set but vault folder doesn't exist -> warns, does NOT create the vault
+    ghost = tmp_path / "no-such-vault"
+    monkeypatch.setattr(tr, "OBSIDIAN_VAULT_DIR", str(ghost))
+    tr.deliver_to_obsidian("2026-06-15", "body")  # must not raise
+    assert not ghost.exists()
 
 
 # ── ledger rendering ────────────────────────────────────────────────────────
