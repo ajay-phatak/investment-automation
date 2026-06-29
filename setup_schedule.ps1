@@ -13,9 +13,9 @@
 
 $ErrorActionPreference = 'Stop'
 
-$scriptDir   = $PSScriptRoot
-$researchBat = Join-Path $scriptDir 'run_research_next.bat'
-$assembleBat = Join-Path $scriptDir 'run_assemble.bat'
+$scriptDir    = $PSScriptRoot
+$researchBat  = Join-Path $scriptDir 'run_research_next.bat'
+$assembleBat  = Join-Path $scriptDir 'run_assemble.bat'
 
 foreach ($bat in @($researchBat, $assembleBat)) {
     if (-not (Test-Path $bat)) {
@@ -23,8 +23,12 @@ foreach ($bat in @($researchBat, $assembleBat)) {
     }
 }
 
-$weekendTask  = 'ThesisResearch-Weekend'
-$assembleTask = 'ThesisResearch-Assemble'
+$weekendTask   = 'ThesisResearch-Weekend'
+$assembleTask  = 'ThesisResearch-Assemble'
+# Legacy: the standalone Friday auth pre-flight is retired now that the agent
+# auths via a long-lived setup-token and the assembly task carries the expiry
+# countdown. Listed only so re-running this script unregisters any old copy.
+$preflightTask = 'ThesisResearch-Preflight'
 
 # Wake the machine from sleep/hibernate for each slot (WakeToRun); recover runs
 # missed while fully off (StartWhenAvailable); tolerate battery power; cap runtime.
@@ -68,8 +72,9 @@ $weekendAction = New-ScheduledTaskAction -Execute $researchBat -WorkingDirectory
 $assembleTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '7:00AM'
 $assembleAction  = New-ScheduledTaskAction -Execute $assembleBat -WorkingDirectory $scriptDir
 
-# Replace any existing copies so re-running this script is idempotent.
-foreach ($name in @($weekendTask, $assembleTask)) {
+# Replace any existing copies so re-running this script is idempotent. The
+# retired pre-flight task is included so it gets removed on re-run.
+foreach ($name in @($weekendTask, $assembleTask, $preflightTask)) {
     if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $name -Confirm:$false
         Write-Host "Removed existing task: $name"
@@ -90,4 +95,4 @@ Write-Host ''
 Write-Host 'Done. Verify with:'
 Write-Host "    Get-ScheduledTask -TaskName 'ThesisResearch-*'"
 Write-Host 'Remove later with:'
-Write-Host "    Unregister-ScheduledTask -TaskName 'ThesisResearch-Weekend','ThesisResearch-Assemble' -Confirm:`$false"
+Write-Host "    Unregister-ScheduledTask -TaskName 'ThesisResearch-Weekend','ThesisResearch-Assemble','ThesisResearch-Preflight' -Confirm:`$false"

@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -88,7 +89,7 @@ ALPACA_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET = os.environ.get("ALPACA_API_SECRET")
 ALPACA_FEED = os.environ.get("ALPACA_FEED", "iex").lower()
 
-CLAUDE_MODEL = "claude-fable-5"
+CLAUDE_MODEL = "claude-opus-4-8"
 # Web research is materially slower than the price-only brief — give it room.
 CLAUDE_TIMEOUT_SEC = 900
 
@@ -106,6 +107,27 @@ BENCHMARK_TICKER = "SPY"
 # indexes disk changes itself, so this works unattended with no plugins/API.
 OBSIDIAN_VAULT_DIR = os.environ.get("OBSIDIAN_VAULT_DIR")
 OBSIDIAN_REPORTS_SUBDIR = "claude reports/market research agent"
+
+# ── Auth health & alerting ──────────────────────────────────────────────────
+# The weekend worker strips ANTHROPIC_API_KEY (see call_claude), so every call
+# rides on the Claude Code *subscription* OAuth token stored here. When that
+# token expires or is revoked the CLI returns HTTP 401 and the only fix is an
+# interactive `claude` → /login. Path is overridable via env for tests.
+CREDENTIALS_PATH = Path(os.environ.get(
+    "CLAUDE_CREDENTIALS_PATH", Path.home() / ".claude" / ".credentials.json"))
+# Optional push channels — set either in .env to get phone/desktop pushes.
+# NOTIFY_NTFY_TOPIC: a private, random ntfy.sh topic (or a full URL); install the
+# ntfy app and subscribe to it. NOTIFY_WEBHOOK_URL: a Slack/Discord/generic webhook.
+NOTIFY_NTFY_TOPIC = os.environ.get("NOTIFY_NTFY_TOPIC")
+NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL")
+# Written when an auth alert fires so the ~16 weekend slots don't each re-push;
+# cleared automatically by the next successful Claude call.
+AUTH_ALERT_SENTINEL = PARTIAL_DIR / "_auth_alert.flag"
+# The long-lived `claude setup-token` token is opaque (no embedded expiry), so
+# record its expiry date by hand (YYYY-MM-DD via CLAUDE_CODE_OAUTH_TOKEN_EXPIRES
+# in .env) when you generate it. Reports count down to it; the pre-flight warns
+# once it's within this many days.
+TOKEN_WARN_DAYS = 30
 
 
 # ── Claude Code CLI plumbing ────────────────────────────────────────────────
@@ -133,6 +155,27 @@ def find_claude_exe() -> str:
     raise RuntimeError("Could not find claude.exe. Install Claude Code or add it to PATH.")
 
 
+class AuthError(RuntimeError):
+    """A Claude CLI call failed authentication (HTTP 401). Unlike a transient
+    error this won't self-heal on retry — the subscription token is expired or
+    revoked and needs an interactive `claude` → /login to refresh."""
+
+
+def _looks_like_auth_failure(*chunks: str) -> bool:
+    blob = "\n".join(c for c in chunks if c).lower()
+    return ("401" in blob and "auth" in blob) or "invalid authentication" in blob \
+        or "failed to authenticate" in blob
+
+
+def _clear_auth_sentinel() -> None:
+    """A successful call proves auth is healthy — drop any stale alert flag so
+    the dedupe resets for next time."""
+    try:
+        AUTH_ALERT_SENTINEL.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def call_claude(prompt: str, allow_web: bool = True) -> str:
     """Run prompt through `claude -p`. Prompt goes via stdin to dodge the
     8191-char Windows command-line limit.
@@ -156,13 +199,196 @@ def call_claude(prompt: str, allow_web: bool = True) -> str:
         env=child_env,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            f"claude -p exited {result.returncode}\n"
-            f"exe: {exe}\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
+        detail = (f"exe: {exe}\n"
+                  f"stdout:\n{result.stdout}\n"
+                  f"stderr:\n{result.stderr}")
+        if _looks_like_auth_failure(result.stdout, result.stderr):
+            raise AuthError(
+                "Claude CLI authentication failed (HTTP 401) — the subscription "
+                "token is expired or revoked. Run `claude` then /login to refresh.\n"
+                + detail)
+        raise RuntimeError(f"claude -p exited {result.returncode}\n" + detail)
+    _clear_auth_sentinel()   # success ⇒ auth is healthy
     return result.stdout.strip()
+
+
+# ── Alerting & auth pre-flight ──────────────────────────────────────────────
+
+def _push_ntfy(title: str, message: str) -> None:
+    if not NOTIFY_NTFY_TOPIC:
+        return
+    url = (NOTIFY_NTFY_TOPIC if NOTIFY_NTFY_TOPIC.startswith("http")
+           else f"https://ntfy.sh/{NOTIFY_NTFY_TOPIC}")
+    try:
+        req = urllib.request.Request(
+            url, data=message.encode("utf-8"),
+            headers={"Title": title, "Priority": "high", "Tags": "warning"})
+        urllib.request.urlopen(req, timeout=15)
+        print(f"[{_ts()}] Alert pushed via ntfy.")
+    except Exception as e:
+        print(f"[{_ts()}] ntfy push failed: {e}")
+
+
+def _push_webhook(title: str, message: str) -> None:
+    if not NOTIFY_WEBHOOK_URL:
+        return
+    text = f"{title}: {message}"
+    # Slack reads {"text"}, Discord reads {"content"} — send both; each ignores the other.
+    payload = json.dumps({"text": text, "content": text}).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            NOTIFY_WEBHOOK_URL, data=payload,
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=15)
+        print(f"[{_ts()}] Alert pushed via webhook.")
+    except Exception as e:
+        print(f"[{_ts()}] webhook push failed: {e}")
+
+
+def _desktop_toast(title: str, message: str) -> None:
+    """Best-effort Windows balloon — handy for the Friday pre-flight when you're
+    likely at the machine. Non-blocking; silently no-ops if it can't render."""
+    if os.name != "nt":
+        return
+    t, m = title.replace("'", "''"), message.replace("'", "''")
+    ps = (
+        "[reflection.assembly]::loadwithpartialname('System.Windows.Forms')|Out-Null;"
+        "$n=New-Object System.Windows.Forms.NotifyIcon;"
+        "$n.Icon=[System.Drawing.SystemIcons]::Warning;$n.Visible=$true;"
+        f"$n.ShowBalloonTip(20000,'{t}','{m}',"
+        "[System.Windows.Forms.ToolTipIcon]::Warning);Start-Sleep -Seconds 6;$n.Dispose()"
+    )
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def notify(title: str, message: str, *, dedupe: bool = False) -> None:
+    """Best-effort alert across every configured channel. Never raises — a
+    failed alert must not take down the run. With dedupe=True it fires at most
+    once per cycle (sentinel-guarded), so the ~16 weekend slots don't each push;
+    the sentinel clears on the next successful Claude call."""
+    print(f"[{_ts()}] ALERT: {title} — {message}")
+    if dedupe:
+        if AUTH_ALERT_SENTINEL.exists():
+            print(f"[{_ts()}] (already alerted this cycle — suppressing push.)")
+            return
+        try:
+            AUTH_ALERT_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+            AUTH_ALERT_SENTINEL.write_text(
+                f"{_ts()}  {title} — {message}\n", encoding="utf-8")
+        except OSError:
+            pass
+    _push_ntfy(title, message)
+    _push_webhook(title, message)
+    _desktop_toast(title, message)
+
+
+def _read_token_expiry() -> tuple[datetime | None, float | None]:
+    """Best-effort (expiry_datetime, days_remaining) from the stored OAuth
+    creds, or (None, None). Reads ONLY the timestamp — never token material.
+    Caveat: this is whatever Claude Code persists as `expiresAt`; if that
+    tracks the short-lived access token it reads near-future every time, so
+    treat the live check in run_preflight as the authoritative signal."""
+    try:
+        data = json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    oauth = data.get("claudeAiOauth", data) if isinstance(data, dict) else {}
+    exp = oauth.get("expiresAt") or oauth.get("expires_at")
+    if not isinstance(exp, (int, float)):
+        return None, None
+    ts = exp / 1000 if exp > 1e11 else exp     # ms vs s epoch
+    try:
+        when = datetime.fromtimestamp(ts, ET)
+    except (OverflowError, OSError, ValueError):
+        return None, None
+    return when, (when - datetime.now(ET)).total_seconds() / 86400
+
+
+def token_expiry() -> tuple[date | None, int | None]:
+    """Parse CLAUDE_CODE_OAUTH_TOKEN_EXPIRES (YYYY-MM-DD) → (date, days_left), or
+    (None, None) if unset/malformed. This is the recorded expiry of the opaque
+    long-lived setup-token, not anything read from the credential store."""
+    raw = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN_EXPIRES", "").strip()
+    if not raw:
+        return None, None
+    try:
+        d = date.fromisoformat(raw)
+    except ValueError:
+        return None, None
+    return d, (d - datetime.now(ET).date()).days
+
+
+def token_countdown_line() -> str:
+    """One-line report footer for the long-lived auth token's countdown, or ""
+    when no expiry is configured (so reports are unchanged without it)."""
+    d, days = token_expiry()
+    if d is None:
+        return ""
+    warn = (" ⚠ regenerate soon with `claude setup-token`"
+            if days is not None and days <= TOKEN_WARN_DAYS else "")
+    return f"_Auth token expires {d.isoformat()} ({days} day(s) left){warn}_\n"
+
+
+def run_preflight(args) -> None:
+    """Manual, on-demand auth check — handy right after `claude setup-token` to
+    confirm the new long-lived token authenticates (key stripped, same model as
+    the weekend run) and to print its recorded expiry. Not scheduled: the weekend
+    run's in-run AuthError backstop and the assembly task's expiry countdown cover
+    the unattended path. Exits 0 if healthy, 1 if it raised an alert."""
+    # Logged purely as a breadcrumb. The stored `expiresAt` tracks the SHORT-LIVED
+    # access token (reads only hours out and refreshes on every call), so it can't
+    # forewarn the refresh-token expiry that actually forces a re-login — hence no
+    # alert keys off it. Over time this line still shows the access token rolling.
+    when, days = _read_token_expiry()
+    if when is not None:
+        print(f"[{_ts()}] Stored access-token expiresAt: {when.isoformat()} "
+              f"({days:+.1f} day(s) from now; informational only).")
+    else:
+        print(f"[{_ts()}] Token expiry not readable — relying on the live check.")
+
+    # The authoritative test: mirror the weekend worker exactly (key stripped,
+    # same model) so a pass here means the weekend run will authenticate too.
+    status, err = "ok", None
+    try:
+        call_claude("Reply with the single word: OK", allow_web=False)
+        print(f"[{_ts()}] Live auth check passed — token is valid.")
+    except AuthError as e:
+        status, err = "dead", e
+    except Exception as e:                       # exe missing, timeout, etc.
+        status, err = "error", e
+
+    if status == "dead":
+        print(f"[{_ts()}] Live auth check FAILED (401).")
+        notify("Thesis agent: re-login needed",
+               "Subscription auth is DEAD (401). Run `claude` then /login before "
+               "the weekend, or the run will produce no report.")
+        sys.exit(1)
+    if status == "error":
+        print(f"[{_ts()}] Pre-flight inconclusive (non-auth error): {err}")
+        sys.exit(1)
+
+    # Long-lived token countdown. Unlike the access-token field above this is a
+    # real ~1-year expiry, so warning off it is meaningful — regenerate before
+    # it lapses and the weekend run loses its fallback auth.
+    exp_date, days_left = token_expiry()
+    if exp_date is not None:
+        print(f"[{_ts()}] Long-lived auth token expires {exp_date.isoformat()} "
+              f"({days_left} day(s) left).")
+        if days_left is not None and days_left <= TOKEN_WARN_DAYS:
+            notify("Thesis agent: auth token expiring",
+                   f"The long-lived token expires in {days_left} day(s) "
+                   f"({exp_date.isoformat()}). Regenerate with `claude setup-token` "
+                   "and update CLAUDE_CODE_OAUTH_TOKEN(_EXPIRES) in .env.")
+            sys.exit(1)
+    else:
+        print(f"[{_ts()}] No CLAUDE_CODE_OAUTH_TOKEN_EXPIRES set — skipping token countdown.")
+    print(f"[{_ts()}] Pre-flight OK — token authenticates.")
+    sys.exit(0)
 
 
 # ── Theses parsing ──────────────────────────────────────────────────────────
@@ -1320,7 +1546,8 @@ def run(args: argparse.Namespace) -> str:
                                                prior_suggestions, combined_enrichment))
 
     header = (f"# Market Research — {report_date}\n\n"
-              f"_Generated {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} from {theses_path.name}_\n")
+              f"_Generated {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} from {theses_path.name}_\n"
+              f"{token_countdown_line()}")
     report = f"{header}\n" + "\n\n---\n\n".join(sections) + "\n"
 
     if args.test:
@@ -1510,6 +1737,19 @@ def run_research_next(args: argparse.Namespace) -> None:
                 build_new_thesis_prompt(preamble, existing, allow_web,
                                         load_scan_suggestions(report_date)),
                 allow_web=allow_web)
+    except AuthError as e:
+        # Global auth failure, not this thesis's fault — undo the attempt bump so
+        # a dead token can't exhaust the per-thesis budget, and alert once.
+        unit["attempts"] -= 1
+        unit["last_error"] = str(e)[:1000]
+        save_manifest(mpath, manifest)
+        notify("Thesis agent: weekend run blocked",
+               f"Auth died mid-batch (401) on {unit['id']}. Re-login with "
+               "`claude` /login; the remaining slots will resume automatically.",
+               dedupe=True)
+        print(f"[{_ts()}] AUTH FAILURE — {unit['id']} left pending; attempt budget preserved.")
+        print(f"[{_ts()}] {e}")
+        sys.exit(1)
     except Exception as e:
         unit["last_error"] = str(e)[:1000]
         save_manifest(mpath, manifest)
@@ -1625,7 +1865,8 @@ def run_assemble(args: argparse.Namespace) -> None:
     header = (f"# Market Research — {report_date}\n\n"
               f"_Weekend batch assembled {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} "
               f"from {manifest['theses_source']} · "
-              f"{len(done)}/{len(units)} units researched_\n")
+              f"{len(done)}/{len(units)} units researched_\n"
+              f"{token_countdown_line()}")
     report = f"{header}\n" + "\n\n---\n\n".join(sections) + "\n"
 
     if args.test:
@@ -1641,6 +1882,17 @@ def run_assemble(args: argparse.Namespace) -> None:
     write_sidecar(report_date, records, scan_records)
     print(f"[{_ts()}] Report saved → {out} (+ history sidecar).")
     deliver_to_obsidian(report_date, report)
+
+    # Forward-looking auth warning, folded into the weekly assembly: the report
+    # header already shows the countdown; push it when the long-lived token is
+    # within TOKEN_WARN_DAYS so a yearly regen never sneaks up. Weekly cadence
+    # means a few nudges before expiry — no dedupe (each is a fresh reminder).
+    exp_date, days_left = token_expiry()
+    if exp_date is not None and days_left is not None and days_left <= TOKEN_WARN_DAYS:
+        notify("Thesis agent: auth token expiring",
+               f"The long-lived token expires in {days_left} day(s) "
+               f"({exp_date.isoformat()}). Regenerate with `claude setup-token` "
+               "and update CLAUDE_CODE_OAUTH_TOKEN(_EXPIRES) in .env.")
 
     # Archive the manifest so next weekend starts a fresh batch.
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1663,10 +1915,14 @@ if __name__ == "__main__":
                       help="Weekend worker: research the next pending unit in this week's batch, then exit")
     mode.add_argument("--assemble", action="store_true",
                       help="Stitch this week's researched batch into the Monday report")
+    mode.add_argument("--preflight", action="store_true",
+                      help="Manual auth check: verify the token authenticates and print its expiry (e.g. after `claude setup-token`)")
     args = parser.parse_args()
 
     print(f"\n{'=' * 60}")
-    if args.research_next:
+    if args.preflight:
+        print(f"  THESIS RESEARCH AGENT — AUTH PRE-FLIGHT")
+    elif args.research_next:
         print(f"  THESIS RESEARCH AGENT — WEEKEND WORKER")
     elif args.assemble:
         print(f"  THESIS RESEARCH AGENT — ASSEMBLE BATCH")
@@ -1674,7 +1930,9 @@ if __name__ == "__main__":
         print(f"  THESIS RESEARCH AGENT")
     print(f"{'=' * 60}\n")
 
-    if args.research_next:
+    if args.preflight:
+        run_preflight(args)
+    elif args.research_next:
         run_research_next(args)
     elif args.assemble:
         run_assemble(args)
