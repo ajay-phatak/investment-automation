@@ -89,7 +89,11 @@ ALPACA_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET = os.environ.get("ALPACA_API_SECRET")
 ALPACA_FEED = os.environ.get("ALPACA_FEED", "iex").lower()
 
-CLAUDE_MODEL = "claude-opus-4-8"
+# Preferred model, with a fallback for when it isn't available on the
+# subscription (Fable 5 comes and goes week to week). Every call tries the
+# preferred model first and retries once on the fallback — see call_claude.
+CLAUDE_MODEL = "claude-fable-5"
+CLAUDE_FALLBACK_MODEL = "claude-opus-4-8"
 # Web research is materially slower than the price-only brief — give it room.
 CLAUDE_TIMEOUT_SEC = 900
 
@@ -167,6 +171,19 @@ def _looks_like_auth_failure(*chunks: str) -> bool:
         or "failed to authenticate" in blob
 
 
+def _looks_like_model_unavailable(*chunks: str) -> bool:
+    """The CLI rejected the requested model outright (pulled from the
+    subscription, no access, bad ID) — as opposed to a transient failure.
+    Heuristic; call_claude retries on the fallback for any non-auth error
+    anyway, this only decides whether to stop trying the preferred model
+    for the rest of the process."""
+    blob = "\n".join(c for c in chunks if c).lower()
+    return ("not_found" in blob or "404" in blob
+            or ("model" in blob and any(s in blob for s in (
+                "not available", "no access", "does not exist",
+                "invalid", "unknown", "not supported"))))
+
+
 def _clear_auth_sentinel() -> None:
     """A successful call proves auth is healthy — drop any stale alert flag so
     the dedupe resets for next time."""
@@ -176,20 +193,21 @@ def _clear_auth_sentinel() -> None:
         pass
 
 
-def call_claude(prompt: str, allow_web: bool = True) -> str:
-    """Run prompt through `claude -p`. Prompt goes via stdin to dodge the
-    8191-char Windows command-line limit.
+# Demoted to CLAUDE_FALLBACK_MODEL once the CLI rejects the preferred model,
+# so later calls in the same process skip the doomed first attempt. Weekend
+# slots are one call per process, so each slot re-probes the preferred model —
+# exactly what we want when Fable's availability changes between weekends.
+_active_model = CLAUDE_MODEL
 
-    Strips ANTHROPIC_API_KEY from just the subprocess env so the CLI falls
-    back to Claude Code subscription auth (no API credits used). The parent
-    shell keeps the key for whatever else needs it."""
+
+def _run_claude(prompt: str, model: str, allow_web: bool) -> "subprocess.CompletedProcess[str]":
     exe = find_claude_exe()
-    cmd = [exe, "-p", "--model", CLAUDE_MODEL]
+    cmd = [exe, "-p", "--model", model]
     if allow_web:
         cmd += ["--allowedTools", "WebSearch,WebFetch"]
     child_env = os.environ.copy()
     child_env.pop("ANTHROPIC_API_KEY", None)
-    result = subprocess.run(
+    return subprocess.run(
         cmd,
         input=prompt,
         capture_output=True,
@@ -198,8 +216,41 @@ def call_claude(prompt: str, allow_web: bool = True) -> str:
         timeout=CLAUDE_TIMEOUT_SEC,
         env=child_env,
     )
+
+
+def call_claude(prompt: str, allow_web: bool = True) -> str:
+    """Run prompt through `claude -p`. Prompt goes via stdin to dodge the
+    8191-char Windows command-line limit.
+
+    Tries CLAUDE_MODEL first and falls back to CLAUDE_FALLBACK_MODEL on any
+    non-auth failure, so unattended slots still complete on weekends when the
+    preferred model isn't available on the subscription.
+
+    Strips ANTHROPIC_API_KEY from just the subprocess env so the CLI falls
+    back to Claude Code subscription auth (no API credits used). The parent
+    shell keeps the key for whatever else needs it."""
+    global _active_model
+    model = _active_model
+    result = _run_claude(prompt, model, allow_web)
+
+    if result.returncode != 0 and model != CLAUDE_FALLBACK_MODEL:
+        if _looks_like_auth_failure(result.stdout, result.stderr):
+            pass  # fall through — a model switch won't fix a dead token
+        else:
+            if _looks_like_model_unavailable(result.stdout, result.stderr):
+                # Preferred model is gone — stop probing it for this process.
+                _active_model = CLAUDE_FALLBACK_MODEL
+                print(f"[{_ts()}] Model {model} unavailable — using "
+                      f"{CLAUDE_FALLBACK_MODEL} for the rest of this run.")
+            else:
+                print(f"[{_ts()}] {model} call failed (exit "
+                      f"{result.returncode}) — retrying once on "
+                      f"{CLAUDE_FALLBACK_MODEL}.")
+            model = CLAUDE_FALLBACK_MODEL
+            result = _run_claude(prompt, model, allow_web)
+
     if result.returncode != 0:
-        detail = (f"exe: {exe}\n"
+        detail = (f"model: {model}\n"
                   f"stdout:\n{result.stdout}\n"
                   f"stderr:\n{result.stderr}")
         if _looks_like_auth_failure(result.stdout, result.stderr):
