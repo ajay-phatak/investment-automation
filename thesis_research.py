@@ -203,8 +203,16 @@ _active_model = CLAUDE_MODEL
 def _run_claude(prompt: str, model: str, allow_web: bool) -> "subprocess.CompletedProcess[str]":
     exe = find_claude_exe()
     cmd = [exe, "-p", "--model", model]
+    # --tools pins the built-in toolset to exactly what research needs.
+    # Without it, `claude -p` exposes the full tool list (Task/Agent, Read,
+    # Bash, ...) and honors the user-level ~/.claude/CLAUDE.md — whose
+    # delegation policy made each weekend slot spawn 2-4 web-research
+    # subagents (~5x the token burn of researching inline).
     if allow_web:
-        cmd += ["--allowedTools", "WebSearch,WebFetch"]
+        cmd += ["--tools", "WebSearch,WebFetch",
+                "--allowedTools", "WebSearch,WebFetch"]
+    else:
+        cmd += ["--tools", ""]
     child_env = os.environ.copy()
     child_env.pop("ANTHROPIC_API_KEY", None)
     return subprocess.run(
