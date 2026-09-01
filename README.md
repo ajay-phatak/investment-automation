@@ -101,6 +101,121 @@ the gap exists. A few sentences is plenty.
 
 Only `## Thesis:` headings are structural. Anything before the first one is treated as the strategy preamble.
 
+### Thesis identity (optional)
+
+A heading may be followed by a yaml control block. It is entirely optional —
+without one, a thesis is identified by its title, exactly as before.
+
+```yaml
+id: iran-energy-shock     # stable identity; history is keyed on this, not the title
+aliases: []               # keys this thesis was tracked under before a rename
+status: active            # active | watch | retired
+version: 1                # bump when you amend the framing
+```
+
+The point is to let you **rename or reframe a thesis without losing its track
+record**. History (continuity, the equity index, conviction calibration) resolves
+through `id` plus `aliases` rather than the title slug, so when you rewrite a
+thesis, move its old title slug into `aliases` and every past week folds into the
+same timeline instead of orphaning a frozen row in the ledger.
+
+A trailing `### Amendments` list documents why the framing changed:
+
+```markdown
+### Amendments
+- 2026-08-31 (v3): Narrowed from "shift to renewables" to the cost pass-through
+  into refrigeration and industrial HVAC — renewables didn't respond, the
+  adjacency did.
+```
+
+**Bumping `version` is what makes a reframe a first-class event.** When the
+version is higher than the one in last week's history, the run treats the thesis
+as amended and:
+
+- tells the analyst its prior take was written under the old framing, to assess
+  the thesis as it now stands rather than relitigating what you dropped, and to
+  say what the reframe means for the positions it was holding;
+- prints an `⚑ Amended (v1 → v2)` banner above the conviction line, with your
+  amendment text, so the change reads as part of the story;
+- tags the conviction delta as "under an amended framing", since the two numbers
+  aren't measuring quite the same claim;
+- keeps the equity index and inception date running, but stamps `version_started`
+  so performance can be read per-framing as well as since inception.
+
+Records written before this schema existed have no version and read as v1, so an
+untouched thesis never shows a phantom banner.
+
+Both the control block and the amendments list are stripped from the body before
+it reaches the model, so only your actual framing is analyzed.
+
+### Lifecycle: `active`, `watch`, `retired`
+
+`status` decides how much work a thesis gets — so keeping an eye on a played-out
+idea, or closing one properly, stops being all-or-nothing.
+
+| status | Claude calls | Mock portfolio | In the report |
+|--------|--------------|----------------|---------------|
+| `active` | 2 (analysis + portfolio) | rebuilt and re-sized weekly | full section |
+| `watch` | 1 (status check) | carried and marked, never re-sized | short section with a **Watch** badge |
+| `retired` | 0 | — | one row in **Closed theses** |
+
+**`watch`** is for a thesis whose main mispricing you think is played out but
+whose story you still want followed. It gets a short "what changed / does this
+still deserve watching" pass, suggests no new tickers, and is explicitly told
+that recommending retirement is a useful answer. Its book keeps being marked to
+market so the track record continues.
+
+> Entry prices on a carried book are re-based to the current price every week. A
+> watched thesis is never re-sized, so without that its weekly return would be
+> measured from the original entry each time and the same move would compound
+> into the equity index week after week.
+
+**`retired`** costs nothing — no prompt, no prices, no new history. Add
+`retired_on` and `retired_note` and the thesis leaves the live ledger for a
+**Closed theses** table carrying its final since-inception and vs-benchmark
+numbers plus your one-line reason. Its past catalyst verdicts stay in the record
+and still count toward conviction calibration. The new-thesis scan is told what
+you retired and why, and may only re-propose it by saying what has changed since.
+
+```yaml
+id: saas-reacceleration
+status: watch
+mode: residual
+spent: [SNOW, DDOG]       # names whose mispricing you consider closed
+```
+
+### Residual mode
+
+`mode: residual` is for the other half of a played-out thesis: you still believe
+the mechanism, but you think the obvious trade is done and what's left is
+wherever the effect hasn't finished propagating.
+
+It rewrites the analysis pass to hunt second-order and adjacent exposure —
+suppliers, customers, input costs, competitors forced to respond, sectors that
+inherit the effect late — and to explain, for each name, *why it hasn't moved
+yet*. It's told that a short list of genuinely un-re-rated names beats a padded
+one, and that "the residual is empty" is an acceptable answer. The rest of the
+pass (steel man, devil's advocate, tickers, portfolio, conviction) is unchanged,
+and the section carries a **Residual** badge.
+
+`spent` lists names whose re-rating you consider finished. They're named in the
+prompt as off-limits, but this stays guidance rather than a filter — the analyst
+may have a real reason to raise one again, and silently stripping it would
+desync the analysis text from the portfolio pass that reads it. A reappearance
+is logged instead:
+
+```
+[21:27:47]   Note: SNOW suggested again despite being listed spent — see the Notes for the stated reason.
+```
+
+Spent names already held in the mock portfolio keep being marked — `spent`
+governs new suggestions, not existing positions.
+
+`mode` and `status` are independent. `active` + `residual` is the usual pairing:
+still worth a full weekly work-up, just pointed at the residual rather than the
+original trade. On a `watch` thesis the mode is moot, since it suggests no names
+at all.
+
 ## Usage
 
 ```bash

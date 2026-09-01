@@ -452,12 +452,135 @@ def run_preflight(args) -> None:
 
 # ── Theses parsing ──────────────────────────────────────────────────────────
 
+# A `## Thesis:` heading may be followed by an optional yaml control block giving
+# the thesis a STABLE identity (`id`) plus `aliases` — history keys it was tracked
+# under before it was renamed. Continuity, the equity index and the calibration
+# ledger all resolve through those keys instead of the title slug, so a thesis can
+# be renamed or reframed without orphaning its track record. An optional trailing
+# `### Amendments` list records why the framing changed. Both are stripped from the
+# body so only the investor's actual framing reaches the prompts; a file with
+# neither parses to defaults and behaves exactly as it did before the schema.
+
 THESIS_HEADING_RE = re.compile(r"^##\s*Thesis:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+CONTROL_BLOCK_RE = re.compile(r"\A\s*```yaml\s*\n(.*?)\n```[ \t]*\n?", re.DOTALL)
+AMENDMENTS_RE = re.compile(r"^###[ \t]*Amendments[ \t]*$\n(.*?)(?=^#{1,3}[ \t]|\Z)",
+                           re.MULTILINE | re.DOTALL | re.IGNORECASE)
+AMENDMENT_ITEM_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})[ \t]*(?:\(v(\d+)\))?[ \t]*[:\-\u2014]?[ \t]*(.*)$")
+AMENDMENT_BULLET_RE = re.compile(r"^[ \t]*[-*][ \t]+")
+
+THESIS_STATUSES = {"active", "watch", "retired"}
+THESIS_MODES = {"standard", "residual"}
+CONTROL_DEFAULTS = {"id": None, "aliases": [], "status": "active", "mode": "standard",
+                    "version": 1, "spent": [], "retired_on": None, "retired_note": None}
+
+
+def _str_list(value) -> list[str]:
+    """Coerce a control-block scalar or sequence into a clean list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def _parse_amendments(region: str) -> list[dict]:
+    """Parse an `### Amendments` region into [{date, version, text}], newest
+    first. Bullets may wrap across lines; continuations fold into the bullet
+    above them. A bullet that does not lead with a date is kept as free text."""
+    raws: list[str] = []
+    for line in region.splitlines():
+        if AMENDMENT_BULLET_RE.match(line):
+            raws.append(AMENDMENT_BULLET_RE.sub("", line).strip())
+        elif raws and line.strip():
+            raws[-1] += " " + line.strip()
+    out = []
+    for raw in raws:
+        m = AMENDMENT_ITEM_RE.match(raw)
+        if m:
+            out.append({"date": m.group(1),
+                        "version": int(m.group(2)) if m.group(2) else None,
+                        "text": m.group(3).strip()})
+        else:
+            out.append({"date": "", "version": None, "text": raw})
+    out.sort(key=lambda a: a["date"], reverse=True)
+    return out
+
+
+def parse_thesis_control(body: str) -> tuple[dict, str, list[dict]]:
+    """Split a raw thesis body into (control, clean_body, amendments).
+
+    `control` always carries every key (defaults when the block is absent),
+    `clean_body` is the framing with the control block and amendments removed,
+    and `amendments` is the parsed change log. Malformed control values are
+    warned about and coerced, never fatal — a bad edit to theses.md must not
+    take down an unattended weekend run."""
+    control = {k: (list(v) if isinstance(v, list) else v)
+               for k, v in CONTROL_DEFAULTS.items()}
+    raw: dict = {}
+
+    m = CONTROL_BLOCK_RE.match(body)
+    if m:
+        loaded = None
+        try:
+            loaded = yaml.safe_load(m.group(1))
+        except yaml.YAMLError as e:
+            print(f"[{_ts()}] Warning: unparseable thesis control block ({e}) — "
+                  "using defaults and leaving the block in the body.")
+        if isinstance(loaded, dict) and (set(loaded) & set(CONTROL_DEFAULTS)):
+            raw = loaded
+            body = body[m.end():]
+        elif loaded is not None:
+            print(f"[{_ts()}] Warning: leading yaml block has no known thesis control "
+                  "keys — leaving it in the body.")
+
+    unknown = sorted(set(raw) - set(CONTROL_DEFAULTS))
+    if unknown:
+        print(f"[{_ts()}] Warning: unknown thesis control key(s) {unknown} — ignored.")
+
+    if raw.get("id"):
+        control["id"] = thesis_key(str(raw["id"]))
+    control["aliases"] = _str_list(raw.get("aliases"))
+    control["spent"] = [t.upper() for t in _str_list(raw.get("spent"))]
+
+    status = str(raw.get("status", CONTROL_DEFAULTS["status"])).strip().lower()
+    if status not in THESIS_STATUSES:
+        print(f"[{_ts()}] Warning: unknown thesis status {status!r} — treating as active.")
+        status = "active"
+    control["status"] = status
+
+    mode = str(raw.get("mode", CONTROL_DEFAULTS["mode"])).strip().lower()
+    if mode not in THESIS_MODES:
+        print(f"[{_ts()}] Warning: unknown thesis mode {mode!r} — treating as standard.")
+        mode = "standard"
+    control["mode"] = mode
+
+    try:
+        control["version"] = max(1, int(raw.get("version", 1)))
+    except (TypeError, ValueError):
+        print(f"[{_ts()}] Warning: non-integer thesis version "
+              f"{raw.get('version')!r} — using 1.")
+
+    for key in ("retired_on", "retired_note"):
+        if raw.get(key):
+            control[key] = str(raw[key]).strip()
+
+    amendments: list[dict] = []
+    am = AMENDMENTS_RE.search(body)
+    if am:
+        amendments = _parse_amendments(am.group(1))
+        body = body[: am.start()] + body[am.end():]
+
+    return control, body.strip(), amendments
 
 
 def parse_theses(path: Path) -> tuple[str, list[dict]]:
-    """Parse a theses Markdown file into (strategy_preamble, [{title, body}]).
-    Anything before the first `## Thesis:` heading is the preamble."""
+    """Parse a theses Markdown file into (strategy_preamble, [thesis, ...]).
+    Anything before the first `## Thesis:` heading is the preamble. Each thesis
+    carries its title and control-stripped body plus its identity and lifecycle
+    fields — see parse_thesis_control."""
     text = path.read_text(encoding="utf-8")
     matches = list(THESIS_HEADING_RE.finditer(text))
     if not matches:
@@ -469,10 +592,14 @@ def parse_theses(path: Path) -> tuple[str, list[dict]]:
     theses = []
     for i, m in enumerate(matches):
         title = m.group(1).strip()
-        body_start = m.end()
         body_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        body = text[body_start:body_end].strip()
-        theses.append({"title": title, "body": body})
+        control, body, amendments = parse_thesis_control(text[m.end():body_end].strip())
+        thesis = dict(control)
+        thesis["id"] = control["id"] or thesis_key(title)
+        thesis["title"] = title
+        thesis["body"] = body
+        thesis["amendments"] = amendments
+        theses.append(thesis)
     return preamble, theses
 
 
@@ -763,6 +890,32 @@ def format_enrichment_table(enrichment: dict) -> str:
 
 # ── Prompt builders ─────────────────────────────────────────────────────────
 
+def _catalyst_meta_spec(prior_context: str | None,
+                        past_cats: list[dict] | None) -> tuple[str, str, str]:
+    """The metadata contract shared by the analysis and watch prompts: the
+    `direction` vocabulary and, when previously flagged catalysts have come due,
+    the structured-verdict block plus its rule. Both prompts must state this
+    identically — normalize_meta parses whichever one produced the response."""
+    direction_values = ("up | down | flat (versus your prior conviction)"
+                        if prior_context else "n/a")
+    outcomes_block, outcomes_rule = "", ""
+    if past_cats:
+        listed = "; ".join(f"{c['date']} {c['what']}" for c in past_cats)
+        outcomes_block = (
+            "\ncatalyst_outcomes:       # one verdict per past-due catalyst from the continuity block\n"
+            '  - {date: 2026-06-29, what: "the event as originally flagged", '
+            'outcome: for, note: "one line on what actually happened"}'
+        )
+        outcomes_rule = (
+            f"\n- `catalyst_outcomes` must contain exactly one entry per past-due catalyst "
+            f"({listed}). `outcome` is exactly one of: for | against | mixed | pending. "
+            "for/against = the event resolved in favor of / against the thesis; mixed = ambiguous; "
+            "pending = postponed or hasn't actually happened yet — re-list pending events under "
+            "`catalysts` with the new expected date."
+        )
+    return direction_values, outcomes_block, outcomes_rule
+
+
 def build_analysis_prompt(strategy_preamble: str, thesis: dict, allow_web: bool,
                           prior_context: str | None = None,
                           past_cats: list[dict] | None = None) -> str:
@@ -784,24 +937,30 @@ def build_analysis_prompt(strategy_preamble: str, thesis: dict, allow_web: bool,
         "what is the net effect on conviction. Be specific — cite dates and numbers.\n\n"
         if prior_context else ""
     )
-    direction_values = "up | down | flat (versus your prior conviction)" if prior_context else "n/a"
+    direction_values, outcomes_block, outcomes_rule = _catalyst_meta_spec(
+        prior_context, past_cats)
 
-    # When previously flagged catalysts have come due, demand a structured verdict
-    # on each so resolution accuracy can be tracked over time (not just prose).
-    outcomes_block, outcomes_rule = "", ""
-    if past_cats:
-        listed = "; ".join(f"{c['date']} {c['what']}" for c in past_cats)
-        outcomes_block = (
-            "\ncatalyst_outcomes:       # one verdict per past-due catalyst from the continuity block\n"
-            '  - {date: 2026-06-29, what: "the event as originally flagged", '
-            'outcome: for, note: "one line on what actually happened"}'
-        )
-        outcomes_rule = (
-            f"\n- `catalyst_outcomes` must contain exactly one entry per past-due catalyst "
-            f"({listed}). `outcome` is exactly one of: for | against | mixed | pending. "
-            "for/against = the event resolved in favor of / against the thesis; mixed = ambiguous; "
-            "pending = postponed or hasn't actually happened yet — re-list pending events under "
-            "`catalysts` with the new expected date."
+    # Residual mode: the investor thinks the headline trade is done but the
+    # mechanism has not finished propagating. Re-pitching the names that already
+    # worked is the failure mode here, so the prompt says so in as many words.
+    residual_block = ""
+    if thesis.get("mode") == "residual":
+        spent = thesis.get("spent") or []
+        spent_line = (
+            f" The investor considers these names spent — their re-rating has already "
+            f"happened, so do NOT put them forward again: {', '.join(spent)}."
+            if spent else "")
+        residual_block = (
+            "\n\nRESIDUAL MODE — the investor believes the PRIMARY mispricing behind this "
+            "thesis is largely priced in already. Do not re-argue the original trade and do "
+            "not re-surface the names that already worked. What you are looking for this "
+            "pass is whatever has NOT transmitted yet: second-order and adjacent exposure — "
+            "suppliers, customers, input costs, competitors forced to respond, sectors that "
+            "inherit the effect late, and names the mechanism has clearly reached where the "
+            "market has not re-rated. For each name you do put forward, the Notes line must "
+            "say why it has not moved yet." + spent_line +
+            " A short list of genuinely un-re-rated names is worth far more than a padded "
+            "one, and if the residual is empty, say that plainly instead of reaching."
         )
 
     return f"""You are an investment research analyst helping a sophisticated retail investor stress-test one of their investment theses. Today is {today}.
@@ -815,7 +974,7 @@ THE THESIS UNDER REVIEW:
 {thesis['body']}{continuity}
 
 YOUR JOB:
-{web_instruction}
+{web_instruction}{residual_block}
 
 Produce a critical analysis of this thesis. Bear in mind: by definition, a thesis like this is one where the investor disagrees with the market, so you SHOULD expect to find more weight of evidence on the "against" side — that's fine, the goal is to give them ammunition for both sides so they can re-examine their conviction.
 
@@ -866,6 +1025,85 @@ CRITICAL FORMATTING RULES:
 """
 
 
+WATCH_PORTFOLIO_NOTE = (
+    "### Mock Portfolio\n\n"
+    "_Carried unchanged from the prior report — a watched thesis is marked to "
+    "market but not re-sized, so no new positions were built this week._")
+
+
+def build_watch_prompt(strategy_preamble: str, thesis: dict, allow_web: bool,
+                       prior_context: str | None = None,
+                       past_cats: list[dict] | None = None) -> str:
+    """Prompt for a thesis on WATCH: one cheap call, no ticker suggestions, no
+    portfolio pass. The investor believes the primary mispricing is largely
+    played out and wants a status check, not a work-up — so the honest answer
+    "there is nothing left here, retire it" has to be an easy one to give."""
+    today = datetime.now(ET).strftime("%A, %B %d, %Y")
+    web_instruction = (
+        "Use WebSearch to check what has actually happened since the prior take — "
+        "news, filings, price action. Keep it focused; this is a status check."
+        if allow_web
+        else "WebSearch is disabled for this run — work from your training knowledge "
+             "and flag where current information would change the picture."
+    )
+    continuity = f"\n\n{prior_context}\n" if prior_context else ""
+    direction_values, outcomes_block, outcomes_rule = _catalyst_meta_spec(
+        prior_context, past_cats)
+
+    return f"""You are an investment research analyst helping a sophisticated retail investor keep an eye on a thesis they have moved to WATCH. Today is {today}.
+
+A watched thesis is one whose primary mispricing the investor believes is largely played out. They are not sizing new positions in it — they want to know whether anything has changed enough to bring it back, or whether it is finished. This is a short status check, NOT a full work-up.
+
+INVESTOR'S STRATEGY CONTEXT:
+{strategy_preamble or "(no strategy preamble provided)"}
+
+THE THESIS UNDER WATCH:
+## Thesis: {thesis['title']}
+
+{thesis['body']}{continuity}
+
+YOUR JOB:
+{web_instruction}
+
+OUTPUT FORMAT — follow exactly. Do not add a top-level header; the script wraps your output.
+
+### Since last week
+3-5 bullets on what actually changed: did flagged catalysts resolve (and how), did price action confirm or contradict the residual claim, is there anything new. Be specific — cite dates and numbers.
+
+### Does this still deserve watching?
+2-4 bullets. What residual claim is still live and not yet priced? What specifically would have to happen for this to be worth re-activating? If the answer is that nothing is left — the mispricing is closed and the story is over — say so plainly and recommend retirement. That is a useful answer, not a failure.
+
+Finally, end your output with a SINGLE fenced yaml metadata block — no heading, nothing after it. The script parses this, so keep it machine-clean:
+
+```yaml
+conviction: 2            # integer 1 (weak / would barely hold) to 5 (high conviction)
+direction: {direction_values}
+conviction_note: "one short line on your conviction and what moved it"
+catalysts:
+  - {{date: 2026-08-15, what: "what happens on/around then"}}{outcomes_block}
+```
+
+CRITICAL FORMATTING RULES:
+- Do NOT output an Indexes section, a Stocks section, a mock portfolio, or any ticker yaml list. This thesis is not being re-sized and no new names should be suggested.
+- The metadata block must have an integer `conviction` and ISO-format (YYYY-MM-DD) `catalysts` dates.
+- `catalysts` is forward-looking: upcoming events only — do not re-list catalysts that have already resolved.{outcomes_rule}
+"""
+
+
+def warn_spent_suggestions(thesis: dict, tickers: list[str]) -> None:
+    """Residual mode asks the analyst to leave the spent names alone. It stays
+    guidance rather than a hard filter — the model may have a real reason to
+    raise one again, and silently stripping it would desync the analysis text
+    from the portfolio pass that reads it — so a reappearance is logged."""
+    spent = {t.upper() for t in (thesis.get("spent") or [])}
+    if not spent:
+        return
+    back = sorted(spent & {t.upper() for t in tickers})
+    if back:
+        print(f"[{_ts()}]   Note: {', '.join(back)} suggested again despite being "
+              "listed spent — see the Notes for the stated reason.")
+
+
 def build_portfolio_prompt(strategy_preamble: str, thesis: dict, analysis_text: str, price_table: str) -> str:
     today = datetime.now(ET).strftime("%A, %B %d, %Y")
     return f"""You are an investment research analyst constructing a hypothetical, educational mock portfolio for one of a sophisticated retail investor's theses. Today is {today}. This is the SECOND pass: the analysis and candidate tickers already exist, and you now have LIVE prices to size positions accurately.
@@ -912,9 +1150,23 @@ SCAN_PROMPT_SUGGESTION_LIMIT = 12  # most recent prior suggestions fed back for 
 
 
 def build_new_thesis_prompt(strategy_preamble: str, existing_titles: list[str], allow_web: bool,
-                            prior_suggestions: list[dict] | None = None) -> str:
+                            prior_suggestions: list[dict] | None = None,
+                            retired_theses: list[dict] | None = None) -> str:
     today = datetime.now(ET).strftime("%A, %B %d, %Y")
     existing = "\n".join(f"- {t}" for t in existing_titles) or "(none)"
+    # Retired ideas are not off-limits the way live ones are — the investor closed
+    # them for a reason, so re-proposing one has to come with what changed since.
+    retired_block = ""
+    if retired_theses:
+        listed = "\n".join(
+            f"- {r.get('title', '')}"
+            + (f" (retired {r['retired_on']})" if r.get("retired_on") else "")
+            + (f" — {r['retired_note']}" if r.get("retired_note") else "")
+            for r in retired_theses)
+        retired_block = f"""
+
+THESES THEY PREVIOUSLY HELD AND RETIRED (do not re-propose one unless something material has changed since it was closed — if you do, state explicitly what is different now):
+{listed}"""
     prior_block = ""
     if prior_suggestions:
         recent = prior_suggestions[-SCAN_PROMPT_SUGGESTION_LIMIT:]
@@ -939,7 +1191,7 @@ INVESTOR'S STRATEGY CONTEXT:
 {strategy_preamble or "(no strategy preamble provided)"}
 
 THESES THEY ALREADY HOLD (do NOT re-suggest variants of these):
-{existing}{prior_block}
+{existing}{retired_block}{prior_block}
 
 YOUR JOB:
 {web_instruction}
@@ -996,6 +1248,30 @@ CATALYST_OUTCOMES = {"for", "against", "mixed", "pending"}
 def thesis_key(title: str) -> str:
     """Normalize a thesis title into a stable key for week-over-week matching."""
     return re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+
+
+def resolve_keys(thesis: dict) -> list[str]:
+    """Every history key a thesis answers to, most-canonical first: its stable
+    id, then any aliases (keys it was tracked under before a rename). Callers
+    hand this to load_prior_state so renaming never orphans a track record."""
+    keys = [thesis.get("id") or thesis_key(thesis.get("title", ""))]
+    for alias in thesis.get("aliases") or []:
+        k = thesis_key(alias)
+        if k and k not in keys:
+            keys.append(k)
+    return [k for k in keys if k]
+
+
+def build_alias_map(theses: list[dict]) -> dict[str, str]:
+    """Map every historical key onto its thesis's canonical id, so the ledger
+    folds a renamed thesis's past records into one timeline instead of leaving
+    an orphaned row frozen at whatever its last tracked week happened to be."""
+    out: dict[str, str] = {}
+    for t in theses:
+        keys = resolve_keys(t)
+        for k in keys:
+            out[k] = keys[0]
+    return out
 
 
 def _to_float(s):
@@ -1063,6 +1339,39 @@ def past_catalysts(rec: dict, today: str) -> list[dict]:
     return out
 
 
+def _to_int(value, default: int) -> int:
+    """Lenient int coercion for values that arrive from yaml or old sidecars."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def amendments_since(thesis: dict, prior_version: int) -> list[dict]:
+    """The amendments the prior week's take has not seen: those tagged with a
+    version above it. Falls back to the newest entry when the log is not
+    version-tagged — only ever called once a version bump is already detected."""
+    ams = thesis.get("amendments") or []
+    tagged = [a for a in ams if isinstance(a.get("version"), int)]
+    if tagged:
+        return [a for a in tagged if a["version"] > prior_version]
+    return ams[:1]
+
+
+def detect_amendment(thesis: dict, prior_rec: dict | None) -> dict | None:
+    """A version bump since the prior week's record means the investor reframed
+    the thesis. Returns {from, to, entries} or None. Sidecars written before the
+    schema carry no version, so they read as v1 and never trigger a false bump."""
+    if not prior_rec:
+        return None
+    prior_version = _to_int(prior_rec.get("version"), 1)
+    version = _to_int(thesis.get("version"), 1)
+    if version <= prior_version:
+        return None
+    return {"from": prior_version, "to": version,
+            "entries": amendments_since(thesis, prior_version)}
+
+
 def parse_portfolio_table(portfolio_md: str) -> list[dict]:
     """Parse holdings out of the pass-2 Mock Portfolio markdown table. Returns
     [{ticker, role, shares, entry_price, weight_pct, is_option}]. Skips the header,
@@ -1099,9 +1408,13 @@ def parse_portfolio_table(portfolio_md: str) -> list[dict]:
     return holdings
 
 
-def load_prior_state(key: str, before_date: str) -> tuple[str, dict] | None:
-    """Most recent sidecar (date < before_date) that contains this thesis key.
-    Returns (prior_report_date, thesis_record) or None."""
+def load_prior_state(keys: str | list[str], before_date: str) -> tuple[str, dict] | None:
+    """Most recent sidecar (date < before_date) containing this thesis. `keys` is
+    its id plus any aliases (see resolve_keys), so a renamed thesis still finds
+    the history it accrued under its old title slug; within a single sidecar the
+    earliest key listed wins. Returns (prior_report_date, thesis_record) or None."""
+    if isinstance(keys, str):
+        keys = [keys]
     dated = sorted(
         (p.name[:10], p) for p in REPORTS_DIR.glob("*_research.json")
         if len(p.name[:10]) == 10 and p.name[:10] < before_date
@@ -1111,9 +1424,10 @@ def load_prior_state(key: str, before_date: str) -> tuple[str, dict] | None:
             data = json.loads(p.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
-        for rec in data.get("theses", []):
-            if rec.get("key") == key:
-                return d, rec
+        by_key = {rec["key"]: rec for rec in data.get("theses", []) if rec.get("key")}
+        for k in keys:
+            if k in by_key:
+                return d, by_key[k]
     return None
 
 
@@ -1174,8 +1488,35 @@ def compute_weekly_return(prior_holdings: list[dict], enrichment: dict) -> tuple
     return legs, weekly
 
 
-def build_prior_context(prior_date: str, rec: dict, today: str) -> str:
-    """Compact continuity block injected into the pass-1 analysis prompt."""
+def roll_holdings(holdings: list[dict], enrichment: dict) -> list[dict]:
+    """Carry a portfolio forward unchanged but re-base every entry price to the
+    current price.
+
+    An active thesis rebuilds its portfolio each week, so entry prices are always
+    last week's marks and the weekly returns chain correctly. A dormant thesis is
+    never re-sized — so without this re-basing its 'weekly' return would be
+    measured from the ORIGINAL entry every week, and the same move would compound
+    into the equity index over and over. Legs with no current price keep their old
+    basis (there is nothing to re-base against); their next measured return spans
+    the gap."""
+    rolled = []
+    for h in holdings:
+        info = enrichment.get((h.get("ticker") or "").upper())
+        if h.get("is_option") or not _is_priced(info):
+            rolled.append(dict(h))
+            continue
+        rolled.append({**h,
+                       "original_entry": h.get("original_entry", h.get("entry_price")),
+                       "entry_price": info["price"]})
+    return rolled
+
+
+def build_prior_context(prior_date: str, rec: dict, today: str,
+                       amendment: dict | None = None) -> str:
+    """Compact continuity block injected into the pass-1 analysis prompt. When
+    `amendment` is set the investor has reframed the thesis since that prior
+    take, so the block says so explicitly — otherwise the model would keep
+    arguing a framing its own reader has already moved on from."""
     lines = [f"CONTINUITY — your prior take on this thesis (from {prior_date}):",
              f"- Prior conviction: {rec.get('conviction')}/5 — \"{rec.get('conviction_note') or ''}\""]
     cats = rec.get("catalysts") or []
@@ -1190,6 +1531,19 @@ def build_prior_context(prior_date: str, rec: dict, today: str) -> str:
             for h in (rec.get("holdings") or []) if not h.get("is_option") and h.get("entry_price")]
     if held:
         lines.append("- Prior mock-portfolio holdings (entry prices): " + ", ".join(held))
+    if amendment:
+        lines.append("")
+        lines.append(f"AMENDED SINCE THAT TAKE (v{amendment['from']} -> v{amendment['to']}) "
+                     "— the investor rewrote this thesis:")
+        for a in amendment["entries"]:
+            stamp = f"{a['date']}: " if a.get("date") else ""
+            lines.append(f"- {stamp}{a.get('text', '')}")
+        lines.append(
+            "The prior take above was written under the OLD framing. Assess the thesis "
+            "AS IT NOW STANDS — do not relitigate the framing the investor has already "
+            "dropped. In 'Since last week', say plainly what the reframe means for the "
+            "prior holdings: which still fit the new framing and which no longer do.")
+        lines.append("")
     lines.append("Use WebSearch to determine what actually changed since then.")
     return "\n".join(lines)
 
@@ -1244,13 +1598,32 @@ def render_outcome_scorecard(outcomes: list[dict]) -> str:
     return "**Catalyst verdicts:** " + " · ".join(parts)
 
 
-def render_conviction_line(meta: dict, prior_conv: int | None) -> str:
+def render_amendment_banner(amendment: dict | None) -> str:
+    """Notice above the conviction line when the investor reframed the thesis
+    since the last report. The reframe is part of the story the report tells,
+    not a silent break in it — so it gets stated, dated and versioned."""
+    if not amendment:
+        return ""
+    lines = [f"> **⚑ Amended (v{amendment['from']} → v{amendment['to']})** — "
+             "_the thesis below was reframed since the last report._"]
+    for a in amendment.get("entries") or []:
+        stamp = f"{a['date']}: " if a.get("date") else ""
+        lines.append(f">")
+        lines.append(f"> {stamp}{a.get('text', '')}")
+    return "\n".join(lines)
+
+
+def render_conviction_line(meta: dict, prior_conv: int | None,
+                           amended: bool = False) -> str:
     conv = meta.get("conviction")
     conv_s = f"{conv}/5" if conv is not None else "n/a"
     if conv is not None and prior_conv is not None:
         tag = (f"↑ from {prior_conv} last week" if conv > prior_conv
                else f"↓ from {prior_conv} last week" if conv < prior_conv
                else f"unchanged at {prior_conv}")
+        # Across a reframe the two numbers are not measuring the same claim.
+        if amended:
+            tag += ", under an amended framing"
     else:
         tag = "first read"
     note = meta.get("conviction_note") or ""
@@ -1258,7 +1631,7 @@ def render_conviction_line(meta: dict, prior_conv: int | None) -> str:
 
 
 def render_performance_block(prior_date, legs, weekly_return, equity_index, inception_date,
-                             bench_weekly=None, bench_index=None) -> str:
+                             bench_weekly=None, bench_index=None, carried=False) -> str:
     if not legs:
         return ("### Portfolio performance\n\n"
                 "_First tracked week — week-over-week performance starts next report._")
@@ -1276,18 +1649,21 @@ def render_performance_block(prior_date, legs, weekly_return, equity_index, ince
     wk_b = f" (vs {BENCHMARK_TICKER} {bench_weekly * 100:+.1f}%)" if bench_weekly is not None else ""
     si_b = (f" vs {BENCHMARK_TICKER} {bench_index - 100:+.1f}%"
             if isinstance(bench_index, (int, float)) else "")
+    held = " · _carried unchanged; not re-sized_" if carried else ""
     summary = (f"\n\n**Thesis weekly return:** {wk}{wk_b} (prior portfolio from {prior_date}) · "
                f"**Since inception ({inception_date}):** {equity_index - 100:+.1f}%{si_b} "
-               f"(index {equity_index:.1f})")
+               f"(index {equity_index:.1f}){held}")
     return "### Portfolio performance\n\n" + "\n".join(head + rows) + summary
 
 
 def compute_and_render(results: list[dict], enrichment: dict, report_date: str) -> tuple[list[str], list[dict]]:
     """Shared post-processing for both flows. For each normalized thesis result
-    {key, title, meta, holdings, rendered_analysis, portfolio_text}, compute the
-    week-over-week performance + running equity index (and the matching benchmark
-    index), render the full section, and build the sidecar record. Returns
-    (sections aligned to results, sidecar records)."""
+    {key, keys, title, meta, holdings, rendered_analysis, portfolio_text}, compute
+    the week-over-week performance + running equity index (and the matching
+    benchmark index), render the full section, and build the sidecar record.
+    `keys` is the thesis's id plus aliases (resolve_keys) and defaults to `key`
+    alone — without it a renamed thesis would restart its equity index at 100.
+    Returns (sections aligned to results, sidecar records)."""
     bench_info = enrichment.get(BENCHMARK_TICKER)
     bench_now = bench_info["price"] if _is_priced(bench_info) else None
     if bench_now is None:
@@ -1297,10 +1673,23 @@ def compute_and_render(results: list[dict], enrichment: dict, report_date: str) 
     sections, records = [], []
     for r in results:
         key, title, meta = r["key"], r["title"], r["meta"]
-        prior = load_prior_state(key, report_date)
+        prior = load_prior_state(r.get("keys") or key, report_date)
         if prior:
             prior_date, prec = prior
+            amendment = detect_amendment(r, prec)
+            prior_version = _to_int(prec.get("version"), 1)
+            version = max(prior_version, _to_int(r.get("version"), 1))
+            # A reframe starts a new chapter of the same track record: the equity
+            # index keeps running, but we stamp when the current framing began so
+            # performance can be read per-framing as well as since inception.
+            version_started = (report_date if amendment
+                               else prec.get("version_started") or prec.get("inception_date")
+                               or prior_date)
             legs, weekly = compute_weekly_return(prec.get("holdings", []), enrichment)
+            # A watched thesis is never re-sized, so it carries the prior book —
+            # with every entry price re-based to today (see roll_holdings).
+            holdings = (roll_holdings(prec.get("holdings", []), enrichment)
+                        if r.get("carry_holdings") else r["holdings"])
             prior_index = prec.get("equity_index") or 100.0
             equity_index = prior_index * (1 + weekly) if weekly is not None else prior_index
             inception_date = prec.get("inception_date") or prior_date
@@ -1319,22 +1708,41 @@ def compute_and_render(results: list[dict], enrichment: dict, report_date: str) 
             prior_date, legs, weekly = None, [], None
             equity_index, inception_date, prior_conv = 100.0, report_date, None
             bench_weekly, bench_index = None, 100.0
+            amendment = None
+            version = _to_int(r.get("version"), 1)
+            version_started = report_date
+            holdings = [] if r.get("carry_holdings") else r["holdings"]
 
         perf = render_performance_block(prior_date, legs, weekly, equity_index, inception_date,
-                                        bench_weekly, bench_index)
-        conv_line = render_conviction_line(meta, prior_conv)
+                                        bench_weekly, bench_index,
+                                        carried=bool(r.get("carry_holdings")))
+        conv_line = render_conviction_line(meta, prior_conv, amended=bool(amendment))
+        banner = render_amendment_banner(amendment)
+        if (r.get("status") or "active") == "watch":
+            badge = ("_◔ **Watch** — monitoring only. The prior book is marked to market "
+                     "but not re-sized, and no new names are suggested._")
+        elif r.get("mode") == "residual":
+            badge = ("_⌕ **Residual** — the primary mispricing is treated as priced; this "
+                     "pass looks for second-order effects that have not transmitted yet._")
+        else:
+            badge = ""
         verdicts = (render_outcome_scorecard(meta["catalyst_outcomes"]) + "\n\n"
                     if meta["catalyst_outcomes"] else "")
         sections.append(
-            f"## Thesis: {title}\n\n{conv_line}\n\n{verdicts}"
+            f"## Thesis: {title}\n\n"
+            + (f"{badge}\n\n" if badge else "") + (f"{banner}\n\n" if banner else "")
+            + f"{conv_line}\n\n{verdicts}"
             f"{r['rendered_analysis']}\n\n{r['portfolio_text']}\n\n{perf}"
         )
         records.append({
             "key": key, "title": title, "inception_date": inception_date,
+            "status": r.get("status") or "active",
+            "mode": r.get("mode") or "standard",
+            "version": version, "version_started": version_started,
             "conviction": meta["conviction"], "direction": meta["direction"],
             "conviction_note": meta["conviction_note"], "catalysts": meta["catalysts"],
             "catalyst_outcomes": meta["catalyst_outcomes"],
-            "holdings": r["holdings"], "weekly_return": weekly,
+            "holdings": holdings, "weekly_return": weekly,
             "equity_index": round(equity_index, 4), "prior_report_date": prior_date,
             "benchmark_ticker": BENCHMARK_TICKER,
             "benchmark_price": round(bench_now, 4) if bench_now is not None else None,
@@ -1345,17 +1753,25 @@ def compute_and_render(results: list[dict], enrichment: dict, report_date: str) 
 
 def render_calibration_section(current_records: list[dict], report_date: str,
                                scan_suggestions: list[dict] | None = None,
-                               enrichment: dict | None = None) -> str:
+                               enrichment: dict | None = None,
+                               alias_map: dict[str, str] | None = None,
+                               retired: list[dict] | None = None) -> str:
     """Book-level ledger + conviction calibration, reading all past sidecars plus
     this run's in-memory records. Calibration pairs conviction[T] with the realized
     weekly_return[T+1] of the same thesis. When scan_suggestions is given (past
-    suggestions + current prices in enrichment), appends the scanner's track record."""
+    suggestions + current prices in enrichment), appends the scanner's track record.
+    `alias_map` (see build_alias_map) folds records written under a thesis's old
+    key into its current timeline, so a rename keeps one continuous history.
+    `retired` moves those theses out of the live ledger into a closed table with
+    their final numbers — retiring a thesis should read as an arc that finished,
+    not as a row that quietly stopped moving."""
+    amap = alias_map or {}
     timeline: dict[str, list[tuple[str, dict]]] = {}
 
     def _add(d, recs):
         for rec in recs:
             if rec.get("key"):
-                timeline.setdefault(rec["key"], []).append((d, rec))
+                timeline.setdefault(amap.get(rec["key"], rec["key"]), []).append((d, rec))
 
     for p in sorted(REPORTS_DIR.glob("*_research.json")):
         d = p.name[:10]
@@ -1369,7 +1785,8 @@ def render_calibration_section(current_records: list[dict], report_date: str,
     for items in timeline.values():
         items.sort(key=lambda t: t[0])
 
-    ledger = []
+    retired_by_key = {r["id"]: r for r in (retired or []) if r.get("id")}
+    ledger, closed = [], []
     for k, items in sorted(timeline.items()):
         _, rec = items[-1]
         wk, eq = rec.get("weekly_return"), rec.get("equity_index")
@@ -1379,8 +1796,19 @@ def render_calibration_section(current_records: list[dict], report_date: str,
         rel_s = (f"{eq - bi:+.1f} pp"
                  if isinstance(eq, (int, float)) and isinstance(bi, (int, float)) else "—")
         conv = rec.get("conviction")
-        ledger.append(f"| {rec.get('title', k)} | {conv if conv is not None else '—'}/5 | "
-                      f"{wk_s} | {si_s} | {rel_s} |")
+        if k in retired_by_key:
+            rt = retired_by_key.pop(k)
+            closed.append(f"| {_md_cell(rt.get('title') or rec.get('title', k))} | "
+                          f"{rt.get('retired_on') or '—'} | {si_s} | {rel_s} | "
+                          f"{_md_cell(rt.get('retired_note') or '') or '—'} |")
+        else:
+            ledger.append(f"| {rec.get('title', k)} | {rec.get('status') or 'active'} | "
+                          f"{conv if conv is not None else '—'}/5 | "
+                          f"{wk_s} | {si_s} | {rel_s} |")
+    # Retired before ever being tracked — still worth showing as closed.
+    for rid, rt in retired_by_key.items():
+        closed.append(f"| {_md_cell(rt.get('title') or rid)} | {rt.get('retired_on') or '—'} "
+                      f"| — | — | {_md_cell(rt.get('retired_note') or '') or '—'} |")
 
     buckets: dict[int, list[float]] = {c: [] for c in range(1, 6)}
     pairs = 0
@@ -1396,17 +1824,28 @@ def render_calibration_section(current_records: list[dict], report_date: str,
     # event text) keeps the latest verdict since reports are walked in date order.
     resolutions: dict[tuple, dict] = {}
     for k, items in timeline.items():
+        # Label every verdict with the thesis's CURRENT title — a rename must not
+        # leave half the report talking about a thesis under a name that no
+        # longer appears anywhere else in it.
+        current_title = items[-1][1].get("title") or k
         for d, rec in items:
             for o in (rec.get("catalyst_outcomes") or []):
                 dedup = (k, o.get("date", ""), thesis_key(o.get("what", ""))[:40])
-                resolutions[dedup] = {"thesis": rec.get("title", k), "reported": d, **o}
+                resolutions[dedup] = {"thesis": current_title, "reported": d, **o}
 
     out = ["## Conviction Calibration & Ledger", "",
            "_Educational backtest of the hypothetical mock portfolios — not financial advice._", "",
            "### Ledger (latest per thesis)", "",
-           f"| Thesis | Conviction | Last weekly return | Since inception | vs {BENCHMARK_TICKER} |",
-           "|--------|-----------|--------------------|-----------------|--------|"]
-    out += ledger or ["| _no theses tracked yet_ | — | — | — | — |"]
+           f"| Thesis | Status | Conviction | Last weekly return | Since inception "
+           f"| vs {BENCHMARK_TICKER} |",
+           "|--------|--------|-----------|--------------------|-----------------|--------|"]
+    out += ledger or ["| _no theses tracked yet_ | — | — | — | — | — |"]
+    if closed:
+        out += ["", "### Closed theses", "",
+                "_Retired from the book — final numbers, kept so the record stays honest._", "",
+                f"| Thesis | Retired | Final since inception | vs {BENCHMARK_TICKER} | Why |",
+                "|--------|---------|-----------------------|--------|-----|"]
+        out += closed
     out += ["", "### Conviction calibration", ""]
     if pairs < CALIBRATION_MIN_PAIRS:
         out.append(f"_Insufficient history to assess calibration ({pairs}/{CALIBRATION_MIN_PAIRS} "
@@ -1542,34 +1981,62 @@ def run(args: argparse.Namespace) -> str:
             sys.exit(1)
         print(f"[{_ts()}] Filter matched {len(theses)} thesis/theses.")
 
+    # Retired theses cost nothing: no prompt, no prices, no sidecar record. They
+    # surface only as a closed row in the ledger and as history the scan knows about.
+    retired = [t for t in theses if t["status"] == "retired"]
+    live = [t for t in theses if t["status"] != "retired"]
+    if retired:
+        print(f"[{_ts()}] {len(retired)} retired thesis/theses — closed out, "
+              "reported in the ledger only.")
+    on_watch_count = sum(1 for t in live if t["status"] == "watch")
+    if on_watch_count:
+        print(f"[{_ts()}] {on_watch_count} thesis/theses on watch — status check only, "
+              "no portfolio pass.")
+
     allow_web = not args.no_web
     report_date = date.today().isoformat()
     results: list[dict] = []
     combined_enrichment: dict = {}
 
-    for i, thesis in enumerate(theses, 1):
-        key = thesis_key(thesis["title"])
-        print(f"[{_ts()}] [{i}/{len(theses)}] Researching: {thesis['title']!r}")
-        prior = load_prior_state(key, report_date)
-        prior_context = build_prior_context(prior[0], prior[1], report_date) if prior else None
+    for i, thesis in enumerate(live, 1):
+        key = thesis["id"]
+        on_watch = thesis["status"] == "watch"
+        print(f"[{_ts()}] [{i}/{len(live)}] "
+              f"{'Watching' if on_watch else 'Researching'}: {thesis['title']!r}")
+        prior = load_prior_state(resolve_keys(thesis), report_date)
+        amendment = detect_amendment(thesis, prior[1]) if prior else None
+        prior_context = (build_prior_context(prior[0], prior[1], report_date, amendment)
+                         if prior else None)
         past_cats = past_catalysts(prior[1], report_date) if prior else []
+        if amendment:
+            print(f"[{_ts()}]   Amended since {prior[0]}: "
+                  f"v{amendment['from']} -> v{amendment['to']} "
+                  f"({len(amendment['entries'])} entry/entries) — reframing the prompt.")
         if prior_context:
             print(f"[{_ts()}]   Continuity: threading in prior take from {prior[0]}"
                   + (f" ({len(past_cats)} catalyst(s) due a verdict)." if past_cats else "."))
+        build_prompt = build_watch_prompt if on_watch else build_analysis_prompt
         analysis_raw = call_claude(
-            build_analysis_prompt(preamble, thesis, allow_web, prior_context, past_cats),
+            build_prompt(preamble, thesis, allow_web, prior_context, past_cats),
             allow_web=allow_web)
         meta, analysis = split_meta_block(analysis_raw)
-        tickers = extract_tickers_from_response(analysis)
+        # A watched thesis suggests no new names; only its carried book is priced.
+        tickers = [] if on_watch else extract_tickers_from_response(analysis)
+        warn_spent_suggestions(thesis, tickers)
         prior_tickers = [h["ticker"] for h in (prior[1].get("holdings") if prior else [])
                          if not h.get("is_option")]
         enrichment = enrich_tickers(tickers + prior_tickers)
         combined_enrichment.update(enrichment)
         rendered = replace_yaml_blocks_with_tables(analysis, enrichment)
-        portfolio = build_portfolio_section(preamble, thesis, analysis, enrichment)
+        portfolio = (WATCH_PORTFOLIO_NOTE if on_watch
+                     else build_portfolio_section(preamble, thesis, analysis, enrichment))
         results.append({
-            "key": key, "title": thesis["title"], "meta": normalize_meta(meta),
-            "holdings": parse_portfolio_table(portfolio),
+            "key": key, "keys": resolve_keys(thesis),
+            "title": thesis["title"], "meta": normalize_meta(meta),
+            "version": thesis["version"], "amendments": thesis["amendments"],
+            "status": thesis["status"], "mode": thesis["mode"],
+            "carry_holdings": on_watch,
+            "holdings": [] if on_watch else parse_portfolio_table(portfolio),
             "rendered_analysis": rendered, "portfolio_text": portfolio,
         })
 
@@ -1587,8 +2054,8 @@ def run(args: argparse.Namespace) -> str:
     scan_records: list[dict] = []
     if not args.skip_new_thesis_scan and not args.thesis:
         print(f"[{_ts()}] Running new-thesis scan...")
-        prompt = build_new_thesis_prompt(preamble, [t["title"] for t in theses], allow_web,
-                                         prior_suggestions)
+        prompt = build_new_thesis_prompt(preamble, [t["title"] for t in live], allow_web,
+                                         prior_suggestions, retired)
         response = call_claude(prompt, allow_web=allow_web)
         scan_enrichment = enrich_tickers(extract_tickers_from_response(response))
         sections.append(replace_yaml_blocks_with_tables(response, scan_enrichment))
@@ -1602,7 +2069,8 @@ def run(args: argparse.Namespace) -> str:
         combined_enrichment.update(enrich_tickers(sugg_missing))
 
     sections.append(render_calibration_section(records, report_date,
-                                               prior_suggestions, combined_enrichment))
+                                               prior_suggestions, combined_enrichment,
+                                               build_alias_map(theses), retired))
 
     header = (f"# Market Research — {report_date}\n\n"
               f"_Generated {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} from {theses_path.name}_\n"
@@ -1672,17 +2140,26 @@ def save_manifest(path: Path, manifest: dict) -> None:
     _write_json_atomic(path, manifest)
 
 
+THESIS_KINDS = ("thesis", "watch")   # units that carry a thesis, vs the scan
+
+
 def create_manifest(theses_path: Path, monday: date) -> dict:
     """Build a fresh batch manifest from theses.md. The new-thesis scan is
-    always appended as the final unit so it runs after the user's own theses."""
+    always appended as the final unit so it runs after the user's own theses.
+    Retired theses get no unit at all — they cost no Claude call and are carried
+    on the manifest only so the ledger and the scan still know about them."""
     preamble, theses = parse_theses(theses_path)
     units = []
-    for i, t in enumerate(theses, 1):
+    for i, t in enumerate([x for x in theses if x["status"] != "retired"], 1):
         units.append({
             "id": f"thesis-{i}",
-            "kind": "thesis",
+            "kind": "watch" if t["status"] == "watch" else "thesis",
             "title": t["title"],
             "body": t["body"],
+            # Identity/lifecycle payload, nested so it cannot collide with the
+            # unit's own id/status (which track batch progress, not the thesis).
+            "thesis": {**{k: t[k] for k in CONTROL_DEFAULTS if k in t},
+                       "amendments": t.get("amendments", [])},
             "status": "pending",       # pending | done
             "attempts": 0,
             "last_error": None,
@@ -1707,8 +2184,25 @@ def create_manifest(theses_path: Path, monday: date) -> dict:
         "created_at": datetime.now(ET).isoformat(),
         "theses_source": theses_path.name,
         "strategy_preamble": preamble,
+        "retired": [{k: t.get(k) for k in
+                     ("id", "title", "aliases", "retired_on", "retired_note")}
+                    for t in theses if t["status"] == "retired"],
         "units": units,
     }
+
+
+def unit_thesis(unit: dict) -> dict:
+    """The thesis identity/lifecycle payload for a manifest unit, in the shape
+    parse_theses produces. Tolerates manifests written before the schema carried
+    one by falling back to the title slug."""
+    t = {k: (list(v) if isinstance(v, list) else v)
+         for k, v in CONTROL_DEFAULTS.items()}
+    t["amendments"] = []
+    t.update(unit.get("thesis") or {})
+    t["title"] = unit.get("title")
+    t["body"] = unit.get("body")
+    t["id"] = t.get("id") or thesis_key(unit.get("title") or "")
+    return t
 
 
 def _next_unit(manifest: dict) -> dict | None:
@@ -1772,29 +2266,40 @@ def run_research_next(args: argparse.Namespace) -> None:
     preamble = manifest["strategy_preamble"]
     report_date = manifest["batch_date"]
     try:
-        if unit["kind"] == "thesis":
+        if unit["kind"] in THESIS_KINDS:
             # In-slot two-pass with week-over-week continuity:
             #   prior context → research (web) → enrich → price-grounded portfolio.
-            thesis = {"title": unit["title"], "body": unit["body"]}
-            prior = load_prior_state(thesis_key(unit["title"]), report_date)
-            prior_context = build_prior_context(prior[0], prior[1], report_date) if prior else None
+            # A watched thesis stops after the first pass — it is marked to market
+            # at assembly and never re-sized, so there is nothing to price here.
+            watching = unit["kind"] == "watch"
+            thesis = unit_thesis(unit)
+            prior = load_prior_state(resolve_keys(thesis), report_date)
+            amendment = detect_amendment(thesis, prior[1]) if prior else None
+            prior_context = (build_prior_context(prior[0], prior[1], report_date, amendment)
+                             if prior else None)
             past_cats = past_catalysts(prior[1], report_date) if prior else []
+            build_prompt = build_watch_prompt if watching else build_analysis_prompt
             analysis_raw = call_claude(
-                build_analysis_prompt(preamble, thesis, allow_web, prior_context, past_cats),
+                build_prompt(preamble, thesis, allow_web, prior_context, past_cats),
                 allow_web=allow_web)
             _, analysis = split_meta_block(analysis_raw)
-            tickers = extract_tickers_from_response(analysis)
-            prior_tickers = [h["ticker"] for h in (prior[1].get("holdings") if prior else [])
-                             if not h.get("is_option")]
-            enrichment = enrich_tickers(tickers + prior_tickers)
-            portfolio = build_portfolio_section(preamble, thesis, analysis, enrichment)
+            if watching:
+                portfolio = WATCH_PORTFOLIO_NOTE
+            else:
+                tickers = extract_tickers_from_response(analysis)
+                warn_spent_suggestions(thesis, tickers)
+                prior_tickers = [h["ticker"] for h in (prior[1].get("holdings") if prior else [])
+                                 if not h.get("is_option")]
+                enrichment = enrich_tickers(tickers + prior_tickers)
+                portfolio = build_portfolio_section(preamble, thesis, analysis, enrichment)
             unit["analysis_response"] = analysis_raw   # raw (incl. meta block); assemble re-splits
             unit["portfolio_response"] = portfolio
         else:
-            existing = [u["title"] for u in manifest["units"] if u["kind"] == "thesis"]
+            existing = [u["title"] for u in manifest["units"] if u["kind"] in THESIS_KINDS]
             unit["raw_response"] = call_claude(
                 build_new_thesis_prompt(preamble, existing, allow_web,
-                                        load_scan_suggestions(report_date)),
+                                        load_scan_suggestions(report_date),
+                                        manifest.get("retired")),
                 allow_web=allow_web)
     except AuthError as e:
         # Global auth failure, not this thesis's fault — undo the attempt bump so
@@ -1860,9 +2365,9 @@ def run_assemble(args: argparse.Namespace) -> None:
     all_tickers: list[str] = []
     parsed: dict[str, dict] = {}
     for u in done:
-        if u["kind"] == "thesis":
+        if u["kind"] in THESIS_KINDS:
             meta, cleaned = split_meta_block(u.get("analysis_response") or u.get("raw_response") or "")
-            prior = load_prior_state(thesis_key(u["title"]), report_date)
+            prior = load_prior_state(resolve_keys(unit_thesis(u)), report_date)
             parsed[u["id"]] = {
                 "meta": meta, "cleaned": cleaned,
                 "holdings": parse_portfolio_table(u.get("portfolio_response") or ""), "prior": prior,
@@ -1880,14 +2385,21 @@ def run_assemble(args: argparse.Namespace) -> None:
     # Pass B — normalize done thesis units (unit order) and render their sections.
     results: list[dict] = []
     for u in units:
-        if u["status"] == "done" and u["kind"] == "thesis":
+        if u["status"] == "done" and u["kind"] in THESIS_KINDS:
             p = parsed[u["id"]]
+            watching = u["kind"] == "watch"
             portfolio = u.get("portfolio_response") or ""
-            if u.get("researched_at"):
+            if u.get("researched_at") and not watching:
                 portfolio = f"_Portfolio priced as of {u['researched_at']}._\n\n{portfolio}"
+            ut = unit_thesis(u)
             results.append({
-                "unit_id": u["id"], "key": thesis_key(u["title"]), "title": u["title"],
-                "meta": normalize_meta(p["meta"]), "holdings": p["holdings"],
+                "unit_id": u["id"], "key": ut["id"],
+                "keys": resolve_keys(ut), "title": u["title"],
+                "version": ut["version"], "amendments": ut["amendments"],
+                "status": ut["status"], "mode": ut["mode"],
+                "carry_holdings": watching,
+                "meta": normalize_meta(p["meta"]),
+                "holdings": [] if watching else p["holdings"],
                 "rendered_analysis": replace_yaml_blocks_with_tables(p["cleaned"], enrichment),
                 "portfolio_text": portfolio,
             })
@@ -1899,7 +2411,7 @@ def run_assemble(args: argparse.Namespace) -> None:
     scan_records: list[dict] = []
     for u in units:
         if u["status"] == "done":
-            if u["kind"] == "thesis":
+            if u["kind"] in THESIS_KINDS:
                 sections.append(sec_by_id[u["id"]])
             else:
                 raw = u.get("raw_response") or ""
@@ -1909,7 +2421,7 @@ def run_assemble(args: argparse.Namespace) -> None:
         else:
             err = f" Last error: {u['last_error']}" if u.get("last_error") else ""
             placeholder = f"> ⚠ Not researched this batch — {u['attempts']} attempt(s).{err}"
-            if u["kind"] == "thesis":
+            if u["kind"] in THESIS_KINDS:
                 sections.append(f"## Thesis: {u['title']}\n\n{placeholder}")
             else:
                 sections.append(f"## Suggested new theses\n\n{placeholder}")
@@ -1918,8 +2430,12 @@ def run_assemble(args: argparse.Namespace) -> None:
     if calendar:
         sections.insert(0, calendar)
 
-    sections.append(render_calibration_section(records, report_date,
-                                               prior_suggestions, enrichment))
+    retired = manifest.get("retired") or []
+    sections.append(render_calibration_section(
+        records, report_date, prior_suggestions, enrichment,
+        build_alias_map([unit_thesis(u) for u in units if u["kind"] in THESIS_KINDS]
+                        + retired),
+        retired))
 
     header = (f"# Market Research — {report_date}\n\n"
               f"_Weekend batch assembled {datetime.now(ET).strftime('%Y-%m-%d %H:%M %Z')} "

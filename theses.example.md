@@ -17,6 +17,16 @@ Suggested tickers should reflect this: prefer broad/liquid ETFs for index exposu
 
 ## Thesis: AI infrastructure spending will exceed consensus through 2027
 
+```yaml
+# Optional. Omit the whole block and the thesis still works — the title
+# becomes its identity. Add it when you want to rename or reframe without
+# losing the tracked history.
+id: ai-infra-capex        # stable identity; never change it
+aliases: []               # keys this thesis was tracked under before a rename
+status: active            # active | watch | retired
+version: 1                # bump when you amend the framing below
+```
+
 The market is treating hyperscaler AI capex as a cyclical bulge that normalizes once frontier-model training scaling hits diminishing returns. I think it's structural and consensus is too low because (a) inference workloads scale with deployed agents, not with model size, and (b) every enterprise rolling out internal copilots is now a perpetual buyer of compute and observability, not a one-time training customer. Picks-and-shovels names with consumption-based revenue should re-rate as 2026 prints come in above the implied trajectory.
 
 ## Thesis: US cannabis rescheduling lands in 2026, sooner than the market is pricing
