@@ -637,3 +637,545 @@ def test_ledger_includes_vs_benchmark_column(tmp_path, monkeypatch):
     out = tr.render_calibration_section(current, "2026-06-15")
     assert f"vs {tr.BENCHMARK_TICKER}" in out
     assert "+2.0 pp" in out
+
+
+# ── thesis identity: control block, aliases, lifecycle fields ───────────────
+
+def _thesis_file(tmp_path, body):
+    f = tmp_path / "theses.md"
+    f.write_text("Strategy preamble.\n\n" + body, encoding="utf-8")
+    return f
+
+
+def _ledger_rows(section):
+    """Data rows of the '### Ledger (latest per thesis)' table only."""
+    body = section.split("### Ledger (latest per thesis)")[1]
+    body = body.split("### Conviction calibration")[0]
+    return [l for l in body.splitlines()
+            if l.startswith("|") and not l.startswith("| Thesis |")
+            and not set(l) <= set("-:| ")]
+
+
+def test_parse_theses_without_control_block_keeps_old_behaviour(tmp_path):
+    f = _thesis_file(tmp_path, "## Thesis: Plain old thesis\nJust a body.\n")
+    _, theses = tr.parse_theses(f)
+    t = theses[0]
+    assert t["title"] == "Plain old thesis"
+    assert t["body"] == "Just a body."
+    assert t["id"] == "plain-old-thesis"          # falls back to the title slug
+    assert t["aliases"] == [] and t["amendments"] == []
+    assert (t["status"], t["mode"], t["version"]) == ("active", "standard", 1)
+
+
+def test_parse_thesis_control_strips_block_and_amendments(tmp_path):
+    f = _thesis_file(tmp_path,
+                     "## Thesis: Reframed idea\n\n"
+                     "```yaml\nid: reframed\naliases: [old-slug, older-slug]\n"
+                     "status: watch\nmode: residual\nversion: 3\n"
+                     "spent: [snow, ddog]\n```\n\n"
+                     "The actual framing.\n\n"
+                     "### Amendments\n"
+                     "- 2026-08-31 (v3): Narrowed onto adjacent\n  industries.\n"
+                     "- 2026-06-15 (v2): Dropped the Europe angle.\n")
+    _, theses = tr.parse_theses(f)
+    t = theses[0]
+    assert t["body"] == "The actual framing."        # block + amendments stripped
+    assert "```yaml" not in t["body"] and "Amendments" not in t["body"]
+    assert t["id"] == "reframed"
+    assert t["aliases"] == ["old-slug", "older-slug"]
+    assert (t["status"], t["mode"], t["version"]) == ("watch", "residual", 3)
+    assert t["spent"] == ["SNOW", "DDOG"]           # normalized to ticker case
+    assert [a["date"] for a in t["amendments"]] == ["2026-08-31", "2026-06-15"]
+    assert t["amendments"][0]["version"] == 3
+    # a wrapped bullet is folded back into one amendment
+    assert t["amendments"][0]["text"] == "Narrowed onto adjacent industries."
+
+
+def test_parse_thesis_control_coerces_bad_values(tmp_path, capsys):
+    f = _thesis_file(tmp_path,
+                     "## Thesis: Sloppy\n\n```yaml\nid: sloppy\nstatus: paused\n"
+                     "mode: turbo\nversion: many\nnonsense: 1\n```\n\nBody.\n")
+    _, theses = tr.parse_theses(f)
+    t = theses[0]
+    assert (t["status"], t["mode"], t["version"]) == ("active", "standard", 1)
+    assert t["id"] == "sloppy" and t["body"] == "Body."
+    warned = capsys.readouterr().out
+    assert "unknown thesis status" in warned and "unknown thesis mode" in warned
+    assert "non-integer thesis version" in warned and "nonsense" in warned
+
+
+def test_parse_thesis_control_leaves_unrelated_yaml_in_body(tmp_path):
+    f = _thesis_file(tmp_path,
+                     "## Thesis: Not a control block\n\n"
+                     "```yaml\nsome_data: 1\n```\n\nBody.\n")
+    _, theses = tr.parse_theses(f)
+    t = theses[0]
+    assert "some_data" in t["body"]                  # left alone, not swallowed
+    assert t["id"] == "not-a-control-block"
+
+
+def test_parse_thesis_control_survives_malformed_yaml(tmp_path, capsys):
+    f = _thesis_file(tmp_path,
+                     "## Thesis: Broken\n\n```yaml\nid: [unclosed\n```\n\nBody.\n")
+    _, theses = tr.parse_theses(f)
+    assert theses[0]["id"] == "broken"               # defaults, no exception
+    assert "unparseable thesis control block" in capsys.readouterr().out
+
+
+def test_resolve_keys_orders_id_then_aliases():
+    t = {"id": "new-id", "aliases": ["Old Title Slug", "new-id", ""],
+         "title": "Ignored When Id Present"}
+    assert tr.resolve_keys(t) == ["new-id", "old-title-slug"]   # deduped, normalized
+    assert tr.resolve_keys({"title": "No Id Here"}) == ["no-id-here"]
+
+
+def test_build_alias_map_points_every_key_at_the_canonical_id():
+    theses = [{"id": "a", "aliases": ["a-old"]}, {"id": "b", "aliases": []}]
+    assert tr.build_alias_map(theses) == {"a": "a", "a-old": "a", "b": "b"}
+
+
+def test_load_prior_state_finds_history_under_an_alias(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    _write_sidecar(tmp_path, "2026-06-08", {
+        "key": "old-title-slug", "title": "Old Title", "equity_index": 118.0,
+        "conviction": 4, "inception_date": "2026-05-11"})
+    thesis = {"id": "new-id", "aliases": ["old-title-slug"], "title": "New Title"}
+
+    got = tr.load_prior_state(tr.resolve_keys(thesis), "2026-06-15")
+    assert got is not None and got[0] == "2026-06-08"
+    assert got[1]["equity_index"] == 118.0 and got[1]["inception_date"] == "2026-05-11"
+    # the new id on its own has no history yet — the alias is what carries it
+    assert tr.load_prior_state(["new-id"], "2026-06-15") is None
+
+
+def test_load_prior_state_prefers_id_over_alias_and_accepts_a_bare_string(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    (tmp_path / "2026-06-08_research.json").write_text(json.dumps({"theses": [
+        {"key": "old-slug", "title": "Old", "equity_index": 90.0},
+        {"key": "new-id", "title": "New", "equity_index": 110.0}]}), encoding="utf-8")
+
+    assert tr.load_prior_state(["new-id", "old-slug"], "2026-06-15")[1]["equity_index"] == 110.0
+    assert tr.load_prior_state("old-slug", "2026-06-15")[1]["equity_index"] == 90.0
+
+
+def test_ledger_merges_a_renamed_thesis_into_one_row(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    _write_sidecar(tmp_path, "2026-06-08", {
+        "key": "old-slug", "title": "Old Framing", "conviction": 4,
+        "weekly_return": 0.02, "equity_index": 102.0, "benchmark_index": 101.0})
+    current = [{"key": "new-id", "title": "New Framing", "conviction": 3,
+                "weekly_return": 0.01, "equity_index": 103.0, "benchmark_index": 101.5}]
+    theses = [{"id": "new-id", "aliases": ["old-slug"], "title": "New Framing"}]
+
+    merged = tr.render_calibration_section(current, "2026-06-15",
+                                           alias_map=tr.build_alias_map(theses))
+    rows = _ledger_rows(merged)
+    assert len(rows) == 1 and "New Framing" in rows[0]
+
+    # without the alias map the abandoned key orphans into its own frozen row
+    assert len(_ledger_rows(tr.render_calibration_section(current, "2026-06-15"))) == 2
+
+
+def test_unit_thesis_falls_back_for_a_pre_schema_manifest():
+    unit = {"id": "thesis-1", "kind": "thesis", "title": "Old Style Thesis",
+            "body": "B", "status": "pending", "attempts": 0}
+    t = tr.unit_thesis(unit)
+    assert t["id"] == "old-style-thesis" and t["body"] == "B"
+    assert t["status"] == "active"      # the thesis status, not the unit's "pending"
+    assert t["aliases"] == [] and t["version"] == 1
+    assert tr.resolve_keys(t) == ["old-style-thesis"]
+
+
+def test_create_manifest_carries_thesis_identity(tmp_path):
+    f = _thesis_file(tmp_path,
+                     "## Thesis: Renamed idea\n\n```yaml\nid: stable-id\n"
+                     "aliases: [older-slug]\nstatus: watch\nmode: residual\n"
+                     "version: 2\nspent: [snow]\n```\n\nBody.\n")
+    manifest = tr.create_manifest(f, tr.date(2026, 6, 15))
+    unit = manifest["units"][0]
+    assert unit["id"] == "thesis-1" and unit["status"] == "pending"   # unit fields intact
+
+    t = tr.unit_thesis(unit)
+    assert t["id"] == "stable-id" and t["aliases"] == ["older-slug"]
+    assert (t["status"], t["mode"], t["version"]) == ("watch", "residual", 2)
+    assert t["spent"] == ["SNOW"] and t["body"] == "Body."
+    assert tr.resolve_keys(t) == ["stable-id", "older-slug"]
+
+
+def test_compute_and_render_continues_the_equity_index_through_a_rename(tmp_path, monkeypatch):
+    """The performance math does its own prior-state lookup — if it ignored the
+    alias keys, renaming a thesis would silently restart its equity index at 100
+    and reset inception to today, which is the whole thing aliases exist to stop."""
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    _write_sidecar(tmp_path, "2026-06-08", {
+        "key": "old-slug", "title": "Old Framing", "inception_date": "2026-05-11",
+        "conviction": 4, "equity_index": 118.0, "benchmark_index": 105.0,
+        "benchmark_ticker": tr.BENCHMARK_TICKER, "benchmark_price": 400.0,
+        "holdings": [_h("AAA", 100.0, 100.0)]})
+    enrichment = {"AAA": {"price": 110.0, "low_52w": 50, "high_52w": 150},
+                  tr.BENCHMARK_TICKER: {"price": 420.0, "low_52w": 300, "high_52w": 500}}
+
+    renamed = {**_result(key="new-id", title="New Framing"),
+               "keys": ["new-id", "old-slug"]}
+    _, records = tr.compute_and_render([renamed], enrichment, "2026-06-15")
+    rec = records[0]
+    assert rec["prior_report_date"] == "2026-06-08"
+    assert rec["inception_date"] == "2026-05-11"            # carried, not restarted
+    assert rec["weekly_return"] == pytest.approx(0.10)
+    assert rec["equity_index"] == pytest.approx(129.8)      # 118.0 * 1.10
+
+    # the same result without alias keys is a fresh thesis — the bug this guards
+    _, plain = tr.compute_and_render([_result(key="new-id", title="New Framing")],
+                                     enrichment, "2026-06-15")
+    assert plain[0]["equity_index"] == 100.0
+    assert plain[0]["inception_date"] == "2026-06-15"
+
+
+# ── amendments: detection, framing, versioned track record ─────────────────
+
+AMENDED = {"id": "reframed", "version": 3, "amendments": [
+    {"date": "2026-08-31", "version": 3, "text": "Rotated onto the adjacency."},
+    {"date": "2026-06-15", "version": 2, "text": "Dropped the Europe angle."}]}
+
+
+def test_detect_amendment_only_fires_on_a_version_bump():
+    assert tr.detect_amendment(AMENDED, None) is None            # first tracked week
+    assert tr.detect_amendment(AMENDED, {"version": 3}) is None  # unchanged
+    assert tr.detect_amendment(AMENDED, {"version": 4}) is None  # never goes backwards
+
+    got = tr.detect_amendment(AMENDED, {"version": 2})
+    assert (got["from"], got["to"]) == (2, 3)
+    assert [a["version"] for a in got["entries"]] == [3]          # only what's new
+
+
+def test_detect_amendment_reads_a_pre_schema_sidecar_as_v1():
+    """Records written before the schema carry no version. They must read as v1
+    so an untouched thesis never shows a phantom amendment banner."""
+    assert tr.detect_amendment({"version": 1, "amendments": []}, {"conviction": 3}) is None
+    got = tr.detect_amendment(AMENDED, {"conviction": 3})
+    assert (got["from"], got["to"]) == (1, 3)
+    assert [a["version"] for a in got["entries"]] == [3, 2]       # both are unseen
+
+
+def test_amendments_since_falls_back_when_the_log_is_untagged():
+    untagged = {"amendments": [{"date": "2026-08-31", "version": None, "text": "Newest."},
+                               {"date": "2026-06-15", "version": None, "text": "Older."}]}
+    assert [a["text"] for a in tr.amendments_since(untagged, 1)] == ["Newest."]
+    assert tr.amendments_since({"amendments": []}, 1) == []
+
+
+def test_prior_context_reframes_the_prompt_when_amended():
+    rec = {"conviction": 3, "conviction_note": "held", "catalysts": [], "holdings": []}
+    amendment = {"from": 1, "to": 2,
+                 "entries": [{"date": "2026-08-31", "version": 2, "text": "Rotated."}]}
+
+    plain = tr.build_prior_context("2026-08-24", rec, "2026-08-31")
+    assert "AMENDED SINCE THAT TAKE" not in plain
+
+    framed = tr.build_prior_context("2026-08-24", rec, "2026-08-31", amendment)
+    assert "AMENDED SINCE THAT TAKE (v1 -> v2)" in framed
+    assert "2026-08-31: Rotated." in framed
+    assert "do not relitigate the framing the investor has already dropped" in framed
+
+
+def test_render_amendment_banner():
+    assert tr.render_amendment_banner(None) == ""
+    banner = tr.render_amendment_banner(
+        {"from": 2, "to": 3, "entries": [{"date": "2026-08-31", "text": "Rotated."}]})
+    assert banner.startswith("> ") and "v2 → v3" in banner
+    assert "> 2026-08-31: Rotated." in banner
+
+
+def test_conviction_line_flags_an_amended_framing():
+    meta = {"conviction": 4, "conviction_note": "n"}
+    assert "under an amended framing" not in tr.render_conviction_line(meta, 3)
+    amended = tr.render_conviction_line(meta, 3, amended=True)
+    assert "↑ from 3 last week, under an amended framing" in amended
+    # nothing to compare against on a first read
+    assert tr.render_conviction_line(meta, None, amended=True).count("first read") == 1
+
+
+def test_compute_and_render_stamps_a_new_chapter_on_reframe(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    _write_sidecar(tmp_path, "2026-06-08", {
+        "key": "t", "title": "T", "inception_date": "2026-05-11", "conviction": 3,
+        "equity_index": 118.0, "version": 1, "version_started": "2026-05-11",
+        "holdings": [_h("AAA", 100.0, 100.0)]})
+    enrichment = {"AAA": {"price": 110.0, "low_52w": 50, "high_52w": 150},
+                  tr.BENCHMARK_TICKER: {"price": 420.0, "low_52w": 300, "high_52w": 500}}
+
+    reframed = {**_result(key="t", title="T"), "version": 2,
+                "amendments": [{"date": "2026-06-15", "version": 2, "text": "Rotated."}]}
+    sections, records = tr.compute_and_render([reframed], enrichment, "2026-06-15")
+    rec = records[0]
+    assert rec["version"] == 2
+    assert rec["version_started"] == "2026-06-15"       # the new chapter starts now
+    assert rec["inception_date"] == "2026-05-11"        # the record itself continues
+    assert rec["equity_index"] == pytest.approx(129.8)  # index keeps compounding
+    assert "⚑ Amended (v1 → v2)" in sections[0]
+    assert "Rotated." in sections[0]
+
+    # an untouched thesis keeps its chapter stamp and shows no banner
+    same = {**_result(key="t", title="T"), "version": 1}
+    sections, records = tr.compute_and_render([same], enrichment, "2026-06-15")
+    assert records[0]["version_started"] == "2026-05-11"
+    assert "Amended" not in sections[0]
+
+
+def test_first_tracked_week_starts_a_chapter_without_a_banner(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    enrichment = {tr.BENCHMARK_TICKER: {"price": 500.0, "low_52w": 400, "high_52w": 520}}
+    sections, records = tr.compute_and_render(
+        [{**_result(), "version": 3, "status": "watch"}], enrichment, "2026-06-08")
+    assert records[0]["version"] == 3
+    assert records[0]["version_started"] == "2026-06-08"
+    assert records[0]["status"] == "watch"
+    assert "Amended" not in sections[0]
+
+
+def test_resolutions_relabel_to_the_current_title_after_a_rename(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    _write_sidecar(tmp_path, "2026-06-08", {
+        "key": "old-slug", "title": "Old Framing", "conviction": 3,
+        "catalyst_outcomes": [{"date": "2026-06-01", "what": "The event",
+                               "outcome": "for", "note": "Resolved."}]})
+    current = [{"key": "new-id", "title": "New Framing", "conviction": 3,
+                "weekly_return": 0.01, "equity_index": 101.0}]
+
+    section = tr.render_calibration_section(
+        current, "2026-06-15",
+        alias_map=tr.build_alias_map([{"id": "new-id", "aliases": ["old-slug"]}]))
+    row = [l for l in section.splitlines() if l.startswith("| 2026-06-01 |")][0]
+    assert "New Framing" in row and "Old Framing" not in row
+
+
+# ── lifecycle: watch, retire, and the entry-price roll ─────────────────────
+
+def _px(**prices):
+    """Enrichment for the given tickers. Note _is_priced rejects on the mere
+    PRESENCE of an 'error' key, so priced entries must not carry one."""
+    return {t: {"price": p, "low_52w": 1.0, "high_52w": 9999.0}
+            for t, p in prices.items()}
+
+
+def test_roll_holdings_rebases_entries_and_remembers_the_original():
+    rolled = tr.roll_holdings([_h("AAA", 100.0, 60.0), _h("BBB", 200.0, 40.0)],
+                              _px(AAA=110.0, BBB=180.0))
+    assert [h["entry_price"] for h in rolled] == [110.0, 180.0]
+    assert [h["original_entry"] for h in rolled] == [100.0, 200.0]
+    assert [h["weight_pct"] for h in rolled] == [60.0, 40.0]
+
+    # rolling twice keeps the FIRST basis as the original
+    again = tr.roll_holdings(rolled, _px(AAA=120.0, BBB=170.0))
+    assert [h["original_entry"] for h in again] == [100.0, 200.0]
+
+
+def test_roll_holdings_leaves_options_and_unpriceable_legs_alone():
+    legs = [_h("OPT", None, 10.0, is_option=True), _h("GONE", 50.0, 20.0)]
+    rolled = tr.roll_holdings(legs, _px(AAA=1.0))       # neither is priceable
+    assert rolled[0]["entry_price"] is None
+    assert rolled[1]["entry_price"] == 50.0             # nothing to re-base against
+    assert "original_entry" not in rolled[1]
+
+
+def test_a_watched_thesis_carries_its_book_without_recompounding(tmp_path, monkeypatch):
+    """The bug this guards: a dormant thesis is never re-sized, so if its entry
+    prices are not re-based each week its 'weekly' return is measured from the
+    original entry every time and the same move compounds into the equity index
+    week after week."""
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+
+    def week(date_s, price, carry, holdings=None):
+        r = {**_result(key="t", title="T"), "status": "watch" if carry else "active",
+             "carry_holdings": carry, "holdings": holdings or []}
+        sections, records = tr.compute_and_render(
+            [r], _px(AAA=price, **{tr.BENCHMARK_TICKER: 500.0}), date_s)
+        (tmp_path / f"{date_s}_research.json").write_text(
+            json.dumps({"theses": records}), encoding="utf-8")
+        return sections[0], records[0]
+
+    week("2026-06-01", 100.0, False, [_h("AAA", 100.0, 100.0)])   # active, built at 100
+    _, r2 = week("2026-06-08", 110.0, True)                       # +10% week
+    _, r3 = week("2026-06-15", 110.0, True)                       # flat week
+    _, r4 = week("2026-06-22", 99.0, True)                        # -10% week
+
+    assert r2["equity_index"] == pytest.approx(110.0)
+    assert r2["holdings"][0]["entry_price"] == 110.0    # re-based
+    assert r2["holdings"][0]["original_entry"] == 100.0
+
+    assert r3["weekly_return"] == pytest.approx(0.0)    # not +10% all over again
+    assert r3["equity_index"] == pytest.approx(110.0)   # would be 121.0 unrolled
+    assert r4["equity_index"] == pytest.approx(99.0)    # tracks AAA exactly
+
+
+def test_watch_section_carries_a_badge_and_a_carried_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    _write_sidecar(tmp_path, "2026-06-08", {
+        "key": "t", "title": "T", "inception_date": "2026-06-08", "conviction": 3,
+        "equity_index": 100.0, "holdings": [_h("AAA", 100.0, 100.0)]})
+    r = {**_result(key="t", title="T"), "status": "watch", "carry_holdings": True}
+    sections, _ = tr.compute_and_render(
+        [r], _px(AAA=110.0, **{tr.BENCHMARK_TICKER: 500.0}), "2026-06-15")
+
+    assert "◔ **Watch**" in sections[0]
+    assert "not re-sized" in sections[0]
+    # an active thesis shows neither
+    plain, _ = tr.compute_and_render(
+        [_result(key="t", title="T")],
+        _px(AAA=110.0, **{tr.BENCHMARK_TICKER: 500.0}), "2026-06-15")
+    assert "Watch" not in plain[0] and "carried unchanged" not in plain[0]
+
+
+def test_create_manifest_skips_retired_and_marks_watch_units(tmp_path):
+    f = _thesis_file(tmp_path,
+                     "## Thesis: Live one\n\n```yaml\nid: live\n```\n\nA.\n\n"
+                     "## Thesis: Watched one\n\n```yaml\nid: watched\n"
+                     "status: watch\n```\n\nB.\n\n"
+                     "## Thesis: Old one\n\n```yaml\nid: old\nstatus: retired\n"
+                     "retired_on: 2026-06-29\nretired_note: Closed.\n```\n\nC.\n")
+    m = tr.create_manifest(f, tr.date(2026, 6, 29))
+
+    assert [(u["id"], u["kind"]) for u in m["units"]] == [
+        ("thesis-1", "thesis"), ("thesis-2", "watch"), ("new-thesis-scan", "scan")]
+    assert [r["id"] for r in m["retired"]] == ["old"]
+    assert m["retired"][0]["retired_on"] == "2026-06-29"
+    assert m["retired"][0]["retired_note"] == "Closed."
+
+
+def test_retired_thesis_moves_from_the_live_ledger_to_a_closed_table(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    _write_sidecar(tmp_path, "2026-06-08", {
+        "key": "old", "title": "Old Idea", "conviction": 2, "weekly_return": 0.01,
+        "equity_index": 112.0, "benchmark_index": 104.0})
+    retired = [{"id": "old", "title": "Old Idea", "retired_on": "2026-06-29",
+                "retired_note": "The mispricing closed."}]
+
+    section = tr.render_calibration_section([], "2026-06-29", retired=retired)
+    live = section.split("### Ledger")[1].split("###")[0]
+    assert "Old Idea" not in live
+    assert "### Closed theses" in section
+
+    closed = section.split("### Closed theses")[1].split("###")[0]
+    assert "Old Idea" in closed and "2026-06-29" in closed
+    assert "+12.0%" in closed and "+8.0 pp" in closed      # final numbers kept
+    assert "The mispricing closed." in closed
+
+
+def test_retired_thesis_that_was_never_tracked_still_closes_cleanly(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    section = tr.render_calibration_section(
+        [], "2026-06-29",
+        retired=[{"id": "never", "title": "Never Tracked", "retired_on": "2026-06-29"}])
+    closed = section.split("### Closed theses")[1]
+    assert "Never Tracked" in closed and "| — | — |" in closed
+
+
+def test_ledger_reports_thesis_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    section = tr.render_calibration_section(
+        [{"key": "a", "title": "A", "status": "watch", "conviction": 2,
+          "weekly_return": 0.0, "equity_index": 100.0},
+         {"key": "b", "title": "B", "conviction": 4,
+          "weekly_return": 0.0, "equity_index": 100.0}], "2026-06-29")
+    assert "| Thesis | Status | Conviction |" in section
+    rows = _ledger_rows(section)
+    assert any(r.startswith("| A | watch |") for r in rows)
+    assert any(r.startswith("| B | active |") for r in rows)   # default
+
+
+def test_watch_prompt_forbids_new_names_and_allows_retirement():
+    prompt = tr.build_watch_prompt("preamble", {"title": "T", "body": "B"},
+                                   allow_web=False)
+    assert "### Indexes" not in prompt and "### Stocks" not in prompt
+    assert "Do NOT output an Indexes section" in prompt
+    assert "recommend retirement" in prompt
+    assert "conviction:" in prompt                     # still yields tracked metadata
+
+    # past-due catalysts still demand structured verdicts, same contract as analysis
+    due = [{"date": "2026-06-01", "what": "The event"}]
+    with_due = tr.build_watch_prompt("p", {"title": "T", "body": "B"}, False,
+                                     prior_context="CONTINUITY — ...", past_cats=due)
+    assert "catalyst_outcomes" in with_due and "for | against | mixed | pending" in with_due
+
+
+def test_scan_prompt_lists_retired_theses_with_a_reopen_condition():
+    retired = [{"title": "Old Idea", "retired_on": "2026-06-29",
+                "retired_note": "Closed."}]
+    prompt = tr.build_new_thesis_prompt("p", ["Live one"], allow_web=False,
+                                        retired_theses=retired)
+    assert "PREVIOUSLY HELD AND RETIRED" in prompt
+    assert "Old Idea (retired 2026-06-29) — Closed." in prompt
+    assert "unless something material has changed" in prompt
+    # retired theses are not held theses — they must not land in the do-not-suggest list
+    held = prompt.split("THESES THEY ALREADY HOLD")[1].split("THESES THEY PREVIOUSLY")[0]
+    assert "Old Idea" not in held
+
+    assert "PREVIOUSLY HELD AND RETIRED" not in tr.build_new_thesis_prompt(
+        "p", ["Live one"], allow_web=False)
+
+
+# ── residual mode ──────────────────────────────────────────────────────────
+
+def test_residual_mode_rewrites_the_job_and_names_the_spent():
+    thesis = {"title": "T", "body": "B", "mode": "residual",
+              "spent": ["SNOW", "DDOG"]}
+    prompt = tr.build_analysis_prompt("preamble", thesis, allow_web=False)
+
+    assert "RESIDUAL MODE" in prompt
+    assert "largely priced in already" in prompt
+    assert "do NOT put them forward again: SNOW, DDOG" in prompt
+    assert "why it has not moved yet" in prompt
+    assert "if the residual is empty, say that plainly" in prompt
+    # it augments the normal pass rather than replacing it
+    assert "### Steel man" in prompt and "### Stocks" in prompt
+
+
+def test_standard_mode_carries_no_residual_block():
+    prompt = tr.build_analysis_prompt("preamble", {"title": "T", "body": "B"},
+                                      allow_web=False)
+    assert "RESIDUAL MODE" not in prompt
+    # a thesis dict from a pre-schema caller has no mode key at all
+    assert "RESIDUAL" not in tr.build_analysis_prompt(
+        "p", {"title": "T", "body": "B", "mode": "standard"}, allow_web=False)
+
+
+def test_residual_mode_without_a_spent_list_still_reframes():
+    prompt = tr.build_analysis_prompt("p", {"title": "T", "body": "B",
+                                            "mode": "residual", "spent": []},
+                                      allow_web=False)
+    assert "RESIDUAL MODE" in prompt
+    assert "considers these names spent" not in prompt   # no empty list dangling
+
+
+def test_warn_spent_suggestions_logs_only_a_real_reappearance(capsys):
+    thesis = {"spent": ["SNOW", "DDOG"]}
+    tr.warn_spent_suggestions(thesis, ["MDB", "ESTC"])
+    assert capsys.readouterr().out == ""
+
+    tr.warn_spent_suggestions(thesis, ["MDB", "snow"])       # case-insensitive
+    out = capsys.readouterr().out
+    assert "SNOW" in out and "listed spent" in out
+    assert "DDOG" not in out
+
+    tr.warn_spent_suggestions({}, ["SNOW"])                  # no spent list
+    assert capsys.readouterr().out == ""
+
+
+def test_residual_section_carries_a_badge(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "REPORTS_DIR", tmp_path)
+    enrichment = _px(**{tr.BENCHMARK_TICKER: 500.0})
+
+    sections, records = tr.compute_and_render(
+        [{**_result(), "mode": "residual"}], enrichment, "2026-06-08")
+    assert "⌕ **Residual**" in sections[0]
+    assert records[0]["mode"] == "residual"
+
+    plain, plain_recs = tr.compute_and_render([_result()], enrichment, "2026-06-08")
+    assert "Residual" not in plain[0]
+    assert plain_recs[0]["mode"] == "standard"
+
+    # watch wins the badge slot — a watched thesis suggests nothing either way
+    watched, _ = tr.compute_and_render(
+        [{**_result(), "mode": "residual", "status": "watch", "carry_holdings": True}],
+        enrichment, "2026-06-08")
+    assert "◔ **Watch**" in watched[0] and "Residual" not in watched[0]
